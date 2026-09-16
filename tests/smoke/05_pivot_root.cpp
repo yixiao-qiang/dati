@@ -42,7 +42,8 @@ int main() {
     // 2) 建 tmpfs 作为新根
     char sbdir[] = "/tmp/sb-XXXXXX";
     if (!mkdtemp(sbdir)) { bad("mkdtemp 失败"); return 2; }
-    if (mount("tmpfs", sbdir, "tmpfs", 0, "size=256m,mode=0700,nodev,noexec,nosuid") != 0) {
+    if (mount("tmpfs", sbdir, "tmpfs", MS_NODEV | MS_NOEXEC | MS_NOSUID, "size=256m,mode=0700") != 0) {
+        std::printf("  mount tmpfs 失败：%s (errno=%d)\n", std::strerror(errno), errno);
         bad("挂载 tmpfs 失败"); return 2;
     }
     std::printf("  tmpfs 挂载于 %s\n", sbdir);

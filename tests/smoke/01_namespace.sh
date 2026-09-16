@@ -22,7 +22,7 @@ echo "宿主基线：mountinfo=$HOST_MOUNTS 行；网卡=[$HOST_NETIF]"
 INNER=$(unshare --mount --pid --net --fork --mount-proc /bin/bash -c '
   printf "MOUNTS=%s\n" "$(wc -l < /proc/self/mountinfo)"
   printf "PROCS=%s\n"  "$(ls -1 /proc | grep -cE "^[0-9]+$")"
-  printf "NETIF=%s\n"  "$(ls /sys/class/net | tr "\n" ",")"
+  printf "NETIF=%s\n"  "$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | tr "\n" ",")"
 ' 2>&1)
 RC=$?
 
