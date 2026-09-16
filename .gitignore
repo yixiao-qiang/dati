@@ -1,0 +1,17 @@
+# ===== 个人学习笔记与总结文档（仅本地保留，不上传仓库）=====
+学习笔记/
+
+# ===== 本地工具目录 =====
+.rivet/
+
+# ===== 构建产物与测试输出 =====
+tests/smoke/build/
+tests/smoke/artifacts/
+*.o
+*.out
+
+# ===== 系统/编辑器杂项 =====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
