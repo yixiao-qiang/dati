@@ -7,6 +7,7 @@
 #include "sandbox.h"
 #include "cgroup.h"
 #include "rootfs.h"
+#include "seccomp_filter.h"
 
 #include <sched.h>
 #include <signal.h>
@@ -66,6 +67,14 @@ static int child_func(void* arg) {
             _exit(127);
         }
         exec_path = "/bin/prog";  // pivot_root 后二进制在 /bin/prog
+    }
+
+    // === 知识点8：seccomp 运行期白名单（必须在 execve 前加载，加载后不可变）===
+    // 面试要点：默认 ERRNO(ENOSYS)，白名单只放行 glibc 启动必调 + 常见 IO/内存
+    // 禁止 fork/socket/execve/ptrace 等危险调用
+    if (seccomp::apply_runtime_filter() != 0) {
+        std::fprintf(stderr, "沙箱：seccomp 加载失败\n");
+        _exit(127);
     }
 
     // execve 运行用户程序

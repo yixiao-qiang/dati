@@ -11,11 +11,15 @@ add_library(sandbox STATIC
     src/cgroup.cpp
     src/rootfs.cpp
     src/runner.cpp
+    src/seccomp.cpp
 )
 
 target_include_directories(sandbox PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# 链接 libseccomp（seccomp-bpf 用户态库）
+target_link_libraries(sandbox PUBLIC seccomp)
 
 # 子目录：冒烟测试
 add_subdirectory(tests/smoke)

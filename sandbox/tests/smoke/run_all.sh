@@ -34,6 +34,7 @@ echo "  构建成功"
 # 测试列表（编号:可执行文件）
 TESTS=(
     "01:test_01_hello"
+    "02:test_02_seccomp"
 )
 
 PASS=0
