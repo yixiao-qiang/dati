@@ -1,5 +1,9 @@
 // Wave 1 · 沙箱主流程
-// 对应知识点：clone flags / SIGSTOP 迁移 / 进程组 / wait4 / 管道 IO
+// 对应知识点：clone flags / 管道同步迁移 / 进程组 / wait4 / 管道 IO
+//
+// 注意：clone(CLONE_NEWPID) 的子进程是新 pidns 的 PID 1（init），
+// PID 1 对未安装 handler 的信号免疫（包括 SIGSTOP），所以不能用 SIGSTOP/SIGCONT 同步，
+// 改用管道 read 阻塞（Wave 0 任务 0.6 的方案，计划允许二选一）。
 #include "sandbox.h"
 #include "cgroup.h"
 #include "rootfs.h"
@@ -21,9 +25,10 @@ namespace sandbox {
 // 传给子进程的参数
 struct ChildArgs {
     std::string binary_path;
-    int in_fd;    // stdin 读端
-    int out_fd;   // stdout 写端
-    int err_fd;   // stderr 写端
+    int sync_read_fd;  // 同步管道读端（等父进程迁移 cgroup 后放行）
+    int in_fd;         // stdin 读端
+    int out_fd;        // stdout 写端
+    int err_fd;        // stderr 写端
     bool use_rootfs;
 };
 
@@ -31,11 +36,13 @@ struct ChildArgs {
 static int child_func(void* arg) {
     ChildArgs* args = static_cast<ChildArgs*>(arg);
 
-    // === 知识点2：子进程自停，等父进程迁移 cgroup ===
-    // SIGSTOP 不可捕获/不可忽略/不可阻塞，一定能停下
-    raise(SIGSTOP);
-
-    // 被 SIGCONT 唤醒后继续执行
+    // === 知识点2：管道同步——阻塞等父进程迁移 cgroup ===
+    // PID 1 对 SIGSTOP 免疫，所以用 read 阻塞代替 raise(SIGSTOP)
+    char sync_byte;
+    if (read(args->sync_read_fd, &sync_byte, 1) != 1) {
+        _exit(127);  // 管道异常
+    }
+    close(args->sync_read_fd);
 
     // === 知识点4：自建进程组，pgid = 自己的 PID ===
     // 之后 fork 的子孙自动继承这个进程组
@@ -94,9 +101,10 @@ JudgeResult run(const SandboxConfig& config) {
         return result;
     }
 
-    // === 2. 创建三个管道：stdin / stdout / stderr ===
-    int in_pipe[2], out_pipe[2], err_pipe[2];
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
+    // === 2. 创建管道：同步 / stdin / stdout / stderr ===
+    int sync_pipe[2], in_pipe[2], out_pipe[2], err_pipe[2];
+    if (pipe(sync_pipe) != 0 || pipe(in_pipe) != 0 ||
+        pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
         result.error_msg = "创建管道失败";
         cgroup::cleanup(cg_path);
         return result;
@@ -105,6 +113,7 @@ JudgeResult run(const SandboxConfig& config) {
     // === 3. 准备子进程参数 ===
     ChildArgs args;
     args.binary_path = config.binary_path;
+    args.sync_read_fd = sync_pipe[0];
     args.in_fd = in_pipe[0];
     args.out_fd = out_pipe[1];
     args.err_fd = err_pipe[1];
@@ -123,6 +132,7 @@ JudgeResult run(const SandboxConfig& config) {
 
     if (child_pid < 0) {
         result.error_msg = std::string("clone 失败: ") + std::strerror(errno);
+        close(sync_pipe[0]); close(sync_pipe[1]);
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
@@ -132,47 +142,49 @@ JudgeResult run(const SandboxConfig& config) {
     }
 
     // === 5. 父进程关闭不需要的管道端 ===
-    // 关键：必须关 out_pipe[1] 和 err_pipe[1]，否则读端永不 EOF
-    close(in_pipe[0]);   // 父不读 stdin
-    close(out_pipe[1]);  // 父不写 stdout
-    close(err_pipe[1]);  // 父不写 stderr
+    close(sync_pipe[0]);  // 父不读同步管道
+    close(in_pipe[0]);    // 父不读 stdin
+    close(out_pipe[1]);   // 父不写 stdout（关键！否则读端永不 EOF）
+    close(err_pipe[1]);   // 父不写 stderr
 
-    // === 6. 等子进程进入停止态（SIGSTOP）===
-    // WUNTRACED：子进程被停止时也返回
-    int status = 0;
-    waitpid(child_pid, &status, WUNTRACED);
-
-    // === 7. 趁子进程停着，迁移进 cgroup ===
+    // === 6. 迁移子进程进 cgroup（子进程此刻阻塞在 sync read 上）===
+    // cgroup 迁移是原子操作，不要求子进程停止；管道保证子进程在 execve 前等待
     if (!cgroup::migrate_pid(child_pid, cg_path)) {
         result.error_msg = "迁移子进程进 cgroup 失败";
-        kill(child_pid, SIGKILL);
-        waitpid(child_pid, &status, 0);
+        // 放行让子进程退出，然后回收
+        char x = 'x';
+        write(sync_pipe[1], &x, 1);
+        close(sync_pipe[1]);
+        waitpid(child_pid, nullptr, 0);
         close(in_pipe[1]); close(out_pipe[0]); close(err_pipe[0]);
         delete[] stack;
         cgroup::cleanup(cg_path);
         return result;
     }
 
-    // === 8. 记录开始时间，放行子进程 ===
+    // === 7. 记录开始时间，写同步管道放行子进程 ===
     auto start = std::chrono::steady_clock::now();
-    kill(child_pid, SIGCONT);
+    char go = 'x';
+    write(sync_pipe[1], &go, 1);
+    close(sync_pipe[1]);
 
-    // === 9. 写 stdin，写完关写端（子进程 read 得到 EOF）===
+    // === 8. 写 stdin，写完关写端（子进程 read 得到 EOF）===
     if (!config.input.empty()) {
         write(in_pipe[1], config.input.data(), config.input.size());
     }
     close(in_pipe[1]);
 
-    // === 10. 设置 stdout/stderr 读端为非阻塞 ===
+    // === 9. 设置 stdout/stderr 读端为非阻塞 ===
     int flags = fcntl(out_pipe[0], F_GETFL);
     fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
     flags = fcntl(err_pipe[0], F_GETFL);
     fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
 
-    // === 11. 主循环：非阻塞读输出 + 超时监控 ===
+    // === 10. 主循环：非阻塞读输出 + 超时监控 ===
     std::string stdout_buf, stderr_buf;
     bool timed_out = false;
     bool child_done = false;
+    int status = 0;
     char buf[4096];
 
     while (!child_done) {
@@ -191,7 +203,6 @@ JudgeResult run(const SandboxConfig& config) {
         if (elapsed_ms > config.time_limit_ms) {
             timed_out = true;
             // === 知识点4：杀进程组，不是只杀一个 PID ===
-            // 子进程自建了进程组，pgid = child_pid，负号表示进程组
             kill(-child_pid, SIGKILL);
             break;
         }
@@ -203,6 +214,7 @@ JudgeResult run(const SandboxConfig& config) {
         } else if (w == 0) {
             usleep(1000);  // 1ms，避免 CPU 100%
         }
+        // w == -1 (ECHILD) 时继续循环，超时逻辑兜底
     }
 
     // 超时 break 后，等子进程真正退出
@@ -222,18 +234,16 @@ JudgeResult run(const SandboxConfig& config) {
         stderr_buf.append(buf, n);
     }
 
-    // === 12. 读 cgroup 计量 ===
+    // === 11. 读 cgroup 计量 ===
     result.cpu_time_us = cgroup::read_cpu_usage(cg_path);
     result.memory_peak_bytes = cgroup::read_memory_peak(cg_path);
     int oom_kill = cgroup::read_oom_kill(cg_path);
 
-    // === 13. 判题状态 ===
+    // === 12. 判题状态 ===
     if (timed_out) {
-        // 超时：有 oom_kill 判 MLE，否则判 TLE
         result.status = (oom_kill > 0) ? Status::MLE : Status::TLE;
     } else if (WIFSIGNALED(status)) {
         result.signal = WTERMSIG(status);
-        // 被信号杀：有 oom_kill 判 MLE，否则判 RUNTIME_ERROR
         result.status = (oom_kill > 0) ? Status::MLE : Status::RUNTIME_ERROR;
     } else if (WIFEXITED(status)) {
         result.exit_code = WEXITSTATUS(status);
@@ -247,7 +257,7 @@ JudgeResult run(const SandboxConfig& config) {
     auto end = std::chrono::steady_clock::now();
     result.wall_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    // === 14. 清理 ===
+    // === 13. 清理 ===
     close(out_pipe[0]);
     close(err_pipe[0]);
     delete[] stack;
