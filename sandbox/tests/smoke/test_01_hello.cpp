@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <unistd.h>
 
 static int g_pass = 0, g_fail = 0;
 static void ok(const char* m)  { std::printf("  [PASS] %s\n", m); ++g_pass; }
