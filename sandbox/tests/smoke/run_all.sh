@@ -55,11 +55,13 @@ for entry in "${TESTS[@]}"; do
 
     echo ""
     echo "########## [$num] $bin ##########"
-    if "$BUILD_DIR/tests/smoke/$bin" 2>&1 | tee "$ARTIFACTS_DIR/${num}_${bin}.log"; then
+    "$BUILD_DIR/tests/smoke/$bin" 2>&1 | tee "$ARTIFACTS_DIR/${num}_${bin}.log"
+    rc=${PIPESTATUS[0]}
+    if [ $rc -eq 0 ]; then
         echo "  => PASS"
         PASS=$((PASS + 1))
     else
-        echo "  => FAIL (rc=$?)"
+        echo "  => FAIL (rc=$rc)"
         FAIL=$((FAIL + 1))
         FAILED_LIST="$FAILED_LIST $num"
     fi

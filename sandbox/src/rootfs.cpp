@@ -41,9 +41,9 @@ int setup(const std::string& binary_path) {
     }
     std::string new_root(tmpl);
 
-    // 3. 挂载 tmpfs（nodev/noexec/nosuid 必须放 mountflags，不能放 data）
+    // 3. 挂载 tmpfs（nodev/nosuid 放 mountflags；不用 NOEXEC，因为要在上面执行 /bin/prog）
     if (mount("tmpfs", new_root.c_str(), "tmpfs",
-              MS_NODEV | MS_NOEXEC | MS_NOSUID,
+              MS_NODEV | MS_NOSUID,
               "size=64m,mode=0700") != 0) {
         std::fprintf(stderr, "rootfs: mount tmpfs 失败: %s\n", std::strerror(errno));
         rmdir(new_root.c_str());
