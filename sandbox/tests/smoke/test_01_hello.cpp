@@ -33,15 +33,16 @@ int main() {
           << "}\n";
     }
 
-    // 2. 静态编译（-static 不需要动态库，骨架阶段 rootfs 简化）
-    std::string cmd = std::string("g++ -static -O2 -o ") + bin_path + " " + src_path + " 2>&1";
+    // 2. 动态编译（默认动态链接，验证 rootfs 的动态库 bind mount 是否生效）
+    //    面试要点：动态程序运行时需要 ld-linux 加载 .so，沙箱必须提供 /lib /lib64 /usr/lib
+    std::string cmd = std::string("g++ -O2 -o ") + bin_path + " " + src_path + " 2>&1";
     int rc = system(cmd.c_str());
     if (rc != 0) {
         bad("编译 hello world 失败");
         std::printf("汇总：PASS=%d FAIL=%d\n", g_pass, g_fail);
         return 1;
     }
-    ok("hello world 编译成功（静态链接）");
+    ok("hello world 编译成功（动态链接）");
 
     // 3. 在沙箱里运行
     sandbox::SandboxConfig cfg;
