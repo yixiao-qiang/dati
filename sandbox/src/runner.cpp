@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cerrno>
+#include <sys/resource.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -31,6 +33,7 @@ struct ChildArgs {
     int out_fd;        // stdout 写端
     int err_fd;        // stderr 写端
     bool use_rootfs;
+    int cpu_limit_sec; // RLIMIT_CPU 兜底（秒），由父进程按 time_limit_ms 换算
 };
 
 // 子进程入口（clone 后执行）

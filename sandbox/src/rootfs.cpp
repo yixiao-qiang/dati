@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
