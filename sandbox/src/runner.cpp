@@ -253,6 +253,7 @@ JudgeResult run(const SandboxConfig& config) {
 
     // === 12. 判题状态 ===
     if (timed_out) {
+        result.signal = 9;  // SIGKILL（父进程杀的）
         result.status = (oom_kill > 0) ? Status::MLE : Status::TLE;
     } else if (WIFSIGNALED(status)) {
         result.signal = WTERMSIG(status);

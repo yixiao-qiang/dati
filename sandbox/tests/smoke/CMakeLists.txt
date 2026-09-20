@@ -11,3 +11,11 @@ target_link_libraries(test_02_seccomp PRIVATE sandbox)
 # 测试 03：文件系统隔离（/etc/passwd 不可见）
 add_executable(test_03_fs_isolation test_03_fs_isolation.cpp)
 target_link_libraries(test_03_fs_isolation PRIVATE sandbox)
+
+# 测试 04：MLE（内存超限被 OOM Kill）
+add_executable(test_04_mle test_04_mle.cpp)
+target_link_libraries(test_04_mle PRIVATE sandbox)
+
+# 测试 05：TLE（死循环超时）
+add_executable(test_05_tle test_05_tle.cpp)
+target_link_libraries(test_05_tle PRIVATE sandbox)

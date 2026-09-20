@@ -47,6 +47,13 @@ std::string create(int memory_limit_mb, int pids_limit) {
         return "";
     }
 
+    // 禁止 swap：否则物理内存超限后走 swap，不会立即 OOM Kill
+    // 面试点：OJ 必须禁 swap，否则 MLE 不触发（内存被换到磁盘，程序继续跑）
+    if (!write_file(cg_path + "/memory.swap.max", "0")) {
+        cleanup(cg_path);
+        return "";
+    }
+
     // 设进程数上限
     if (!write_file(cg_path + "/pids.max", std::to_string(pids_limit))) {
         cleanup(cg_path);
