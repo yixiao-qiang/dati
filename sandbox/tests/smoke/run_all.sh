@@ -33,6 +33,7 @@ echo "  构建成功"
 
 # 测试列表（编号:可执行文件）
 TESTS=(
+    "00:test_00_status"
     "01:test_01_hello"
     "02:test_02_seccomp"
     "03:test_03_fs_isolation"
