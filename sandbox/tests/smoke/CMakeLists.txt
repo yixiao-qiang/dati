@@ -7,3 +7,7 @@ target_link_libraries(test_01_hello PRIVATE sandbox)
 # 测试 02：seccomp 运行期白名单拦截 socket()
 add_executable(test_02_seccomp test_02_seccomp.cpp)
 target_link_libraries(test_02_seccomp PRIVATE sandbox)
+
+# 测试 03：文件系统隔离（/etc/passwd 不可见）
+add_executable(test_03_fs_isolation test_03_fs_isolation.cpp)
+target_link_libraries(test_03_fs_isolation PRIVATE sandbox)

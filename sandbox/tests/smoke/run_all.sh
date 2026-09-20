@@ -35,6 +35,7 @@ echo "  构建成功"
 TESTS=(
     "01:test_01_hello"
     "02:test_02_seccomp"
+    "03:test_03_fs_isolation"
 )
 
 PASS=0
