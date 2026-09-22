@@ -23,3 +23,7 @@ target_link_libraries(test_04_mle PRIVATE sandbox)
 # 测试 05：TLE（死循环超时）
 add_executable(test_05_tle test_05_tle.cpp)
 target_link_libraries(test_05_tle PRIVATE sandbox)
+
+# 测试 06：OLE（输出超限）
+add_executable(test_06_ole test_06_ole.cpp)
+target_link_libraries(test_06_ole PRIVATE sandbox)

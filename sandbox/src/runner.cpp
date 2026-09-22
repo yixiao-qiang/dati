@@ -196,18 +196,37 @@ JudgeResult run(const SandboxConfig& config) {
     std::string stdout_buf, stderr_buf;
     bool timed_out = false;
     bool child_done = false;
+    bool ole_triggered = false;
+    int64_t output_limit_bytes = (int64_t)config.output_limit_mb *1024 *1024;
     int status = 0;
     char buf[4096];
 
     while (!child_done) {
         // 读 stdout
         ssize_t n = read(out_pipe[0], buf, sizeof(buf));
-        if (n > 0) stdout_buf.append(buf, n);
         // n == 0: EOF；n == -1 && errno == EAGAIN: 暂时没数据
-
+        if(n > 0){
+            // 未超限才 append；append 后可能超一块（最多 4095 字节），由下面的判断捕获
+            if(stdout_buf.size() < output_limit_bytes){
+                stdout_buf.append(buf, n);
+            }
+            // OLE 判断：stdout + stderr 总量超限即触发
+            // >= 与 > 在此等价：要触发 OLE 必须 size > limit（恰好等于时程序已正常退出）
+            // 保留 >= 仅为语义直观
+            if(stdout_buf.size() + stderr_buf.size() >= output_limit_bytes){
+                ole_triggered = true;
+                // 立即杀进程组并 break，不靠超时兜底
+                // kill 后管道写端关闭，后面的 drain read 会得到 EOF，不矛盾
+                kill(-child_pid, SIGKILL);
+                break;
+            }
+        }
         // 读 stderr
+        // OLE 触发后 stderr 永久丢弃：总量已超限，再收无意义
+        // 注意：判断用 stdout+stderr 之和，但 stderr 触发 OLE 后被冻结，
+        // 此时 stdout 继续涨仍会让总和 >= limit，逻辑自洽
         n = read(err_pipe[0], buf, sizeof(buf));
-        if (n > 0) stderr_buf.append(buf, n);
+        if (n > 0 && !ole_triggered) stderr_buf.append(buf, n);
 
         // 检查墙钟超时
         auto now = std::chrono::steady_clock::now();
@@ -230,20 +249,21 @@ JudgeResult run(const SandboxConfig& config) {
     }
 
     // 超时 break 后，等子进程真正退出
-    if (timed_out) {
+    if (timed_out || ole_triggered) {
         waitpid(child_pid, &status, 0);
     }
 
-    // drain 剩余输出
+    // drain 剩余输出：把管道里残留的数据读完，确保管道缓冲区清空
+    // OLE 触发后只 read 不 append（已超限，再收无意义），但必须 read 否则管道可能满
     while (true) {
         ssize_t n = read(out_pipe[0], buf, sizeof(buf));
         if (n <= 0) break;
-        stdout_buf.append(buf, n);
+        if (!ole_triggered) stdout_buf.append(buf, n);
     }
     while (true) {
         ssize_t n = read(err_pipe[0], buf, sizeof(buf));
         if (n <= 0) break;
-        stderr_buf.append(buf, n);
+        if (!ole_triggered) stderr_buf.append(buf, n);
     }
 
     // === 11. 读 cgroup 计量 ===
@@ -252,7 +272,14 @@ JudgeResult run(const SandboxConfig& config) {
     int oom_kill = cgroup::read_oom_kill(cg_path);
 
     // === 12. 判题状态 ===
-    if (timed_out) {
+    // 优先级：OLE > TLE > MLE > 信号 > 正常退出
+    // OLE 优先：输出超限是最明确的判题结果，即使程序同时超时/被杀也优先报 OLE
+    if(ole_triggered){
+        result.signal = 9;
+        result.status = Status::OLE;
+        // 注：OLE 时不读 exit_code——输出已截断，退出码不反映真实程序行为
+    }
+    else if (timed_out) {
         result.signal = 9;  // SIGKILL（父进程杀的）
         result.status = (oom_kill > 0) ? Status::MLE : Status::TLE;
     } else if (WIFSIGNALED(status)) {

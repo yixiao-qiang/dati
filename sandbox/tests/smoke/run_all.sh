@@ -39,6 +39,7 @@ TESTS=(
     "03:test_03_fs_isolation"
     "04:test_04_mle"
     "05:test_05_tle"
+    "06:test_06_ole"
 )
 
 PASS=0
