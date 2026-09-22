@@ -40,6 +40,7 @@ TESTS=(
     "04:test_04_mle"
     "05:test_05_tle"
     "06:test_06_ole"
+    "07:test_07_ole_stderr"
 )
 
 PASS=0

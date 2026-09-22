@@ -33,7 +33,10 @@ struct ChildArgs {
     int out_fd;        // stdout 写端
     int err_fd;        // stderr 写端
     bool use_rootfs;
-    int cpu_limit_sec; // RLIMIT_CPU 兜底（秒），由父进程按 time_limit_ms 换算
+    // RLIMIT_CPU 兜底（秒），由父进程按 time_limit_ms 换算。
+    // 注意：任务 1.6 尚未接线 setrlimit，此字段当前无人写入/读取；
+    // 先初始化为 0 避免未初始化成员，待任务 1.6 实现后启用。
+    int cpu_limit_sec = 0;
 };
 
 // 子进程入口（clone 后执行）
@@ -202,31 +205,35 @@ JudgeResult run(const SandboxConfig& config) {
     char buf[4096];
 
     while (!child_done) {
-        // 读 stdout
+        // 读 stdout（未超限才 append；append 后可能超一块，最多 4095 字节）
         ssize_t n = read(out_pipe[0], buf, sizeof(buf));
         // n == 0: EOF；n == -1 && errno == EAGAIN: 暂时没数据
-        if(n > 0){
-            // 未超限才 append；append 后可能超一块（最多 4095 字节），由下面的判断捕获
+        if(n > 0 && !ole_triggered){
             if(stdout_buf.size() < output_limit_bytes){
                 stdout_buf.append(buf, n);
             }
-            // OLE 判断：stdout + stderr 总量超限即触发
-            // >= 与 > 在此等价：要触发 OLE 必须 size > limit（恰好等于时程序已正常退出）
-            // 保留 >= 仅为语义直观
-            if(stdout_buf.size() + stderr_buf.size() >= output_limit_bytes){
-                ole_triggered = true;
-                // 立即杀进程组并 break，不靠超时兜底
-                // kill 后管道写端关闭，后面的 drain read 会得到 EOF，不矛盾
-                kill(-child_pid, SIGKILL);
-                break;
+        }
+
+        // 读 stderr（同样设 append 上限，否则只写 stderr 的程序会无上限涨）
+        n = read(err_pipe[0], buf, sizeof(buf));
+        if (n > 0 && !ole_triggered){
+            if(stderr_buf.size() < output_limit_bytes){
+                stderr_buf.append(buf, n);
             }
         }
-        // 读 stderr
-        // OLE 触发后 stderr 永久丢弃：总量已超限，再收无意义
-        // 注意：判断用 stdout+stderr 之和，但 stderr 触发 OLE 后被冻结，
-        // 此时 stdout 继续涨仍会让总和 >= limit，逻辑自洽
-        n = read(err_pipe[0], buf, sizeof(buf));
-        if (n > 0 && !ole_triggered) stderr_buf.append(buf, n);
+
+        // OLE 判断：stdout + stderr 总量超限即触发
+        // 位置关键：必须放在两路 read 之后、分支之外。曾放在 stdout 的
+        // if(n>0) 里，导致只写 stderr 的程序（stdout 长期 EAGAIN）完全
+        // 逃过 OLE 判定，跑满墙钟被判 TLE —— 实测 wall 3002ms vs 302ms。
+        // >= 与 > 在此等价：要触发 OLE 必须 size > limit（恰好等于时程序已正常退出）
+        if(stdout_buf.size() + stderr_buf.size() >= output_limit_bytes){
+            ole_triggered = true;
+            // 立即杀进程组并 break，不靠超时兜底
+            // kill 后管道写端关闭，后面的 drain read 会得到 EOF，不矛盾
+            kill(-child_pid, SIGKILL);
+            break;
+        }
 
         // 检查墙钟超时
         auto now = std::chrono::steady_clock::now();
@@ -254,17 +261,20 @@ JudgeResult run(const SandboxConfig& config) {
     }
 
     // drain 剩余输出：把管道里残留的数据读完，确保管道缓冲区清空
-    // OLE 触发后只 read 不 append（已超限，再收无意义），但必须 read 否则管道可能满
-    while (true) {
-        ssize_t n = read(out_pipe[0], buf, sizeof(buf));
-        if (n <= 0) break;
-        if (!ole_triggered) stdout_buf.append(buf, n);
-    }
-    while (true) {
-        ssize_t n = read(err_pipe[0], buf, sizeof(buf));
-        if (n <= 0) break;
-        if (!ole_triggered) stderr_buf.append(buf, n);
-    }
+    // 两条约束：① OLE 触发后只 read 不 append（已超限，再收无意义）；
+    //           ② 正常退出路径也要受 output_limit_bytes 约束，
+    //              否则退出前管道积压的大量数据会把内存再吃一遍。
+    auto drain_capped = [&](int fd, std::string& out) {
+        while (true) {
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            if (out.size() < output_limit_bytes) {
+                out.append(buf, (size_t)n);
+            }
+        }
+    };
+    drain_capped(out_pipe[0], stdout_buf);
+    drain_capped(err_pipe[0], stderr_buf);
 
     // === 11. 读 cgroup 计量 ===
     result.cpu_time_us = cgroup::read_cpu_usage(cg_path);

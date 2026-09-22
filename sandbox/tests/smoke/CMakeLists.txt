@@ -27,3 +27,7 @@ target_link_libraries(test_05_tle PRIVATE sandbox)
 # 测试 06：OLE（输出超限）
 add_executable(test_06_ole test_06_ole.cpp)
 target_link_libraries(test_06_ole PRIVATE sandbox)
+
+# 测试 07：OLE 的 stderr 路径（只写 stderr 也须判 OLE）
+add_executable(test_07_ole_stderr test_07_ole_stderr.cpp)
+target_link_libraries(test_07_ole_stderr PRIVATE sandbox)
