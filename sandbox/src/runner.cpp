@@ -137,7 +137,9 @@ JudgeResult run(const SandboxConfig& config) {
     args.out_fd = out_pipe[1];
     args.err_fd = err_pipe[1];
     args.use_rootfs = config.use_rootfs;
-    args.cpu_limit_sec = (config.time_limit_ms + 999) / 1000;
+    int cpu_sec = config.time_limit_ms /1000 *2;
+    if (cpu_sec < 5) cpu_sec = 5;
+    args.cpu_limit_sec = cpu_sec;
     // === 4. clone 创建隔离子进程 ===
     // 知识点1：CLONE_NEWNS|NEWPID|NEWNET|NEWUTS|NEWIPC 一次性建多重隔离
     const size_t STACK_SIZE = 1024 * 1024;  // 1MB 栈
@@ -206,7 +208,7 @@ JudgeResult run(const SandboxConfig& config) {
     bool ole_triggered = false;
     int64_t output_limit_bytes = (int64_t)config.output_limit_mb *1024 *1024;
     int status = 0;
-    struct rusage rusage;
+    struct rusage rusage{};
     char buf[4096];
 
     while (!child_done) {

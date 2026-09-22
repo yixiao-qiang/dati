@@ -48,7 +48,6 @@ int main() {
         return 1;
     }
     ok("TLE 测试程序编译成功");
-
     // 3. 在沙箱里运行：限 1 秒
     sandbox::SandboxConfig cfg;
     cfg.binary_path = bin_path;
@@ -84,7 +83,11 @@ int main() {
     } else {
         bad(("墙钟时间异常: " + std::to_string((int)wall_ms) + "ms").c_str());
     }
-
+    if(result.cpu_time_us > 0){
+        ok(("cpu_time_us = " + std::to_string(result.cpu_time_us) + " > 0（rusage 兜底生效）").c_str());
+    } else{
+        bad("cpu_time_us = 0 (rusage 兜底未生效)");
+    }
     std::printf("  [INFO] exit_code=%d signal=%d cpu_time_us=%ld wall_ms=%.0f\n",
                 result.exit_code, result.signal, result.cpu_time_us, wall_ms);
 
