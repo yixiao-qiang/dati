@@ -84,7 +84,7 @@ int main() {
         bad(("墙钟时间异常: " + std::to_string((int)wall_ms) + "ms").c_str());
     }
     if(result.cpu_time_us > 0){
-        ok(("cpu_time_us = " + std::to_string(result.cpu_time_us) + " > 0（rusage 兜底生效）").c_str());
+       ok(("cpu_time_us = " + std::to_string(result.cpu_time_us) + " > 0（CPU 计量非零）").c_str());
     } else{
         bad("cpu_time_us = 0 (rusage 兜底未生效)");
     }
