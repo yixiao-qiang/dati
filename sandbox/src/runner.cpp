@@ -34,7 +34,6 @@ struct ChildArgs {
     int err_fd;        // stderr 写端
     bool use_rootfs;
     // RLIMIT_CPU 兜底（秒），由父进程按 time_limit_ms 换算。
-    // 注意：任务 1.6 尚未接线 setrlimit，此字段当前无人写入/读取；
     // 先初始化为 0 避免未初始化成员，待任务 1.6 实现后启用。
     int cpu_limit_sec = 0;
 };
@@ -82,7 +81,12 @@ static int child_func(void* arg) {
         std::fprintf(stderr, "沙箱：seccomp 加载失败\n");
         _exit(127);
     }
-
+    if (args->cpu_limit_sec > 0){
+        struct rlimit r1;
+        r1.rlim_cur = args->cpu_limit_sec;
+        r1.rlim_max = args->cpu_limit_sec;
+        setrlimit(RLIMIT_CPU, &r1);
+    }
     // execve 运行用户程序
     char* argv[] = { strdup(exec_path.c_str()), nullptr };
     char* envp[] = { nullptr };
@@ -133,7 +137,7 @@ JudgeResult run(const SandboxConfig& config) {
     args.out_fd = out_pipe[1];
     args.err_fd = err_pipe[1];
     args.use_rootfs = config.use_rootfs;
-
+    args.cpu_limit_sec = (config.time_limit_ms + 999) / 1000;
     // === 4. clone 创建隔离子进程 ===
     // 知识点1：CLONE_NEWNS|NEWPID|NEWNET|NEWUTS|NEWIPC 一次性建多重隔离
     const size_t STACK_SIZE = 1024 * 1024;  // 1MB 栈
@@ -202,6 +206,7 @@ JudgeResult run(const SandboxConfig& config) {
     bool ole_triggered = false;
     int64_t output_limit_bytes = (int64_t)config.output_limit_mb *1024 *1024;
     int status = 0;
+    struct rusage rusage;
     char buf[4096];
 
     while (!child_done) {
@@ -246,7 +251,7 @@ JudgeResult run(const SandboxConfig& config) {
         }
 
         // 非阻塞检查子进程是否退出
-        pid_t w = waitpid(child_pid, &status, WNOHANG);
+        pid_t w = wait4(child_pid, &status, WNOHANG, &rusage);
         if (w == child_pid) {
             child_done = true;
         } else if (w == 0) {
@@ -257,7 +262,7 @@ JudgeResult run(const SandboxConfig& config) {
 
     // 超时 break 后，等子进程真正退出
     if (timed_out || ole_triggered) {
-        waitpid(child_pid, &status, 0);
+        wait4(child_pid, &status, 0, &rusage);
     }
 
     // drain 剩余输出：把管道里残留的数据读完，确保管道缓冲区清空
@@ -278,6 +283,12 @@ JudgeResult run(const SandboxConfig& config) {
 
     // === 11. 读 cgroup 计量 ===
     result.cpu_time_us = cgroup::read_cpu_usage(cg_path);
+    if (result.cpu_time_us == 0){
+        result.cpu_time_us = (int64_t)rusage.ru_utime.tv_sec *1000000
+                            + rusage.ru_utime.tv_usec
+                            + (int64_t)rusage.ru_stime.tv_sec *1000000
+                            + rusage.ru_stime.tv_usec;
+    }
     result.memory_peak_bytes = cgroup::read_memory_peak(cg_path);
     int oom_kill = cgroup::read_oom_kill(cg_path);
 
