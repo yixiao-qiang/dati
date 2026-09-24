@@ -31,3 +31,7 @@ target_link_libraries(test_06_ole PRIVATE sandbox)
 # 测试 07：OLE 的 stderr 路径（只写 stderr 也须判 OLE）
 add_executable(test_07_ole_stderr test_07_ole_stderr.cpp)
 target_link_libraries(test_07_ole_stderr PRIVATE sandbox)
+
+# 测试 08：网络隔离（沙箱内不能联网）
+add_executable(test_08_net_ test_08_net_.cpp)
+target_link_libraries(test_08_net_ PRIVATE sandbox)
