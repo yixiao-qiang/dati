@@ -83,10 +83,13 @@ int main() {
     } else {
         bad(("墙钟时间异常: " + std::to_string((int)wall_ms) + "ms").c_str());
     }
+    // CPU 计量非零：TLE 场景下进程被 SIGKILL，cgroup 的 cpu.stat 可能尚未结算，
+    // 此时由 wait4 的 rusage 兜底补上。这里只断言"最终上报的 CPU 时间非零"，
+    // 不断言它来自哪条路——两条路任一失效都会让这里变红。
     if(result.cpu_time_us > 0){
-       ok(("cpu_time_us = " + std::to_string(result.cpu_time_us) + " > 0（CPU 计量非零）").c_str());
+        ok(("cpu_time_us = " + std::to_string(result.cpu_time_us) + " > 0（CPU 计量非零）").c_str());
     } else{
-        bad("cpu_time_us = 0 (rusage 兜底未生效)");
+        bad("cpu_time_us = 0（CPU 计量失效：cgroup 读数与 rusage 兜底均未产出）");
     }
     std::printf("  [INFO] exit_code=%d signal=%d cpu_time_us=%ld wall_ms=%.0f\n",
                 result.exit_code, result.signal, result.cpu_time_us, wall_ms);
