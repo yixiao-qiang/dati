@@ -144,8 +144,8 @@ int setup(const std::string& binary_path) {
 
     // 8. 卸载旧根（MNT_DETACH 延迟卸载，防止旧根还有引用时 umount 失败）
     if (umount2(".", MNT_DETACH) != 0) {
-        std::fprintf(stderr, "rootfs: umount2 旧根失败: %s\n", std::strerror(errno));
-        // 不返回失败，继续执行（旧根还在但不影响基本功能）
+        std::fprintf(stderr, "rootfs: umount2 旧根失败: 隔离不完整拒绝继续\n", std::strerror(errno));
+        return -1;
     }
 
     // 9. chdir 到新根
