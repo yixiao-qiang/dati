@@ -112,7 +112,7 @@ const char* status_to_string(Status s) {
 
 JudgeResult run(const SandboxConfig& config) {
     JudgeResult result;
-
+    signal(SIGPIPE, SIG_IGN);
     // === 1. 创建 cgroup ===
     std::string cg_path = cgroup::create(config.memory_limit_mb, config.pids_limit);
     if (cg_path.empty()) {
@@ -190,13 +190,27 @@ JudgeResult run(const SandboxConfig& config) {
     close(sync_pipe[1]);
 
     // === 8. 写 stdin，写完关写端（子进程 read 得到 EOF）===
+    int flags = fcntl(in_pipe[1], F_GETFL);
+    fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
     if (!config.input.empty()) {
-        write(in_pipe[1], config.input.data(), config.input.size());
+        size_t written = 0;
+        size_t total = config.input.size();
+        while(written < total){
+            ssize_t n = write(in_pipe[1], config.input.data() + written, total - written);
+            if(n > 0){
+                written += n;
+            }else if(n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+                //管道满了，等待1ms后再写
+                usleep(1000);
+            }else {
+                break;
+            }
+        }
     }
     close(in_pipe[1]);
 
     // === 9. 设置 stdout/stderr 读端为非阻塞 ===
-    int flags = fcntl(out_pipe[0], F_GETFL);
+    flags = fcntl(out_pipe[0], F_GETFL);
     fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
     flags = fcntl(err_pipe[0], F_GETFL);
     fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
