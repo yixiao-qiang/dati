@@ -1,4 +1,4 @@
-// Wave 1 · seccomp 系统调用过滤实现
+﻿// Wave 1 · seccomp 系统调用过滤实现
 //
 // 面试要点：
 // - libseccomp 三段式：seccomp_init → seccomp_rule_add → seccomp_load
@@ -18,7 +18,7 @@ namespace seccomp {
 // 运行期白名单：允许 glibc 启动必调 + 常见 IO/内存 syscall
 // 禁止（默认 ERRNO 拒绝，不需 explicitly 列）：
 //   fork/vfork/clone/clone3（防 fork 炸弹）
-//   execve（防执行别的程序）
+//   execve（必须放行：子进程加载 seccomp 后自己要 execve 启动用户程序）
 //   socket/connect/bind/listen/accept（防网络访问）
 //   ptrace（防调试逃逸）
 //   mount/pivot_root/chroot（防文件系统操作）
