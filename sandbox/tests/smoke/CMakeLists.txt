@@ -35,3 +35,7 @@ target_link_libraries(test_07_ole_stderr PRIVATE sandbox)
 # 测试 08：网络隔离（沙箱内不能联网）
 add_executable(test_08_net_ test_08_net_.cpp)
 target_link_libraries(test_08_net_ PRIVATE sandbox)
+
+# 测试 09：pids.max fork 炸弹隔离（验收表第 10 条，隔离有效性关键项）
+add_executable(test_09_pids test_09_pids.cpp)
+target_link_libraries(test_09_pids PRIVATE sandbox)

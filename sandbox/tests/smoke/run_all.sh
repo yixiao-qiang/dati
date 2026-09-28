@@ -42,6 +42,7 @@ TESTS=(
     "06:test_06_ole"
     "07:test_07_ole_stderr"
     "08:test_08_net_"
+    "09:test_09_pids"
 )
 
 PASS=0
