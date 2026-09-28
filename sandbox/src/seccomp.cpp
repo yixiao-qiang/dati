@@ -76,7 +76,6 @@ int apply_runtime_filter() {
         SCMP_SYS(ioctl),              // 终端相关，printf 可能调
         SCMP_SYS(close_range),
         SCMP_SYS(uname),
-        SCMP_SYS(prlimit64),
         SCMP_SYS(getuid), SCMP_SYS(getgid),
         SCMP_SYS(geteuid), SCMP_SYS(getegid),
         SCMP_SYS(clock_gettime),
