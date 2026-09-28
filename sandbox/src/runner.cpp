@@ -1,4 +1,4 @@
-// Wave 1 · 沙箱主流程
+﻿// Wave 1 · 沙箱主流程
 // 对应知识点：clone flags / 管道同步迁移 / 进程组 / wait4 / 管道 IO
 //
 // 注意：clone(CLONE_NEWPID) 的子进程是新 pidns 的 PID 1（init），
@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <sys/resource.h>
+#include <sys/prctl.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -77,7 +78,10 @@ static int child_func(void* arg) {
     // === 知识点8：seccomp 运行期白名单（必须在 execve 前加载，加载后不可变）===
     // 面试要点：默认 ERRNO(ENOSYS)，白名单只放行 glibc 启动必调 + 常见 IO/内存
     // 禁止 fork/socket/execve/ptrace 等危险调用
-     if (args->cpu_limit_sec > 0){
+     // 防止提权：execve 不获得新权限（现代容器标准做法）
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    if (args->cpu_limit_sec > 0){
         struct rlimit r1;
         r1.rlim_cur = args->cpu_limit_sec;
         r1.rlim_max = args->cpu_limit_sec;
