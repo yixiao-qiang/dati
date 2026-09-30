@@ -43,3 +43,7 @@ target_link_libraries(test_09_pids PRIVATE sandbox)
 # 测试 10：隔离结构断言（验收表第 1/2/3/4/5 条）
 add_executable(test_10_isolation_struct test_10_isolation_struct.cpp)
 target_link_libraries(test_10_isolation_struct PRIVATE sandbox)
+
+# 测试 11：管道 EOF（验收表第 16 条）
+add_executable(test_11_pipe_eof test_11_pipe_eof.cpp)
+target_link_libraries(test_11_pipe_eof PRIVATE sandbox)

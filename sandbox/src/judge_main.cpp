@@ -57,7 +57,10 @@ int main(int argc, char* argv[]) {
     std::printf("\"mem_bytes\": %ld,", (long)result.memory_peak_bytes);
     std::printf("\"wall_us\": %ld,", (long)result.wall_time_us);
     std::printf("\"stdout\": \"%s\",", json_escape(result.stdout_output).c_str());
-    std::printf("\"stderr\": \"%s\"", json_escape(result.stderr_output).c_str());
+    std::printf("\"stderr\": \"%s\",", json_escape(result.stderr_output).c_str());
+    // error_msg：沙箱内部失败原因（如 cgroup 创建失败、clone 失败），
+    // 必须带出给前端——否则用户只看到 INTERNAL_ERROR，不知道怎么办
+    std::printf("\"error_msg\": \"%s\"", json_escape(result.error_msg).c_str());
     std::printf("}\n");
 
     return 0;

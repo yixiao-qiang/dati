@@ -44,6 +44,7 @@ TESTS=(
     "08:test_08_net_"
     "09:test_09_pids"
     "10:test_10_isolation_struct"
+    "11:test_11_pipe_eof"
 )
 
 PASS=0

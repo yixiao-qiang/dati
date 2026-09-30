@@ -3,7 +3,7 @@
 // 覆盖的验收项（原 16 条表中均标注 ⚠ 未覆盖，只在实现里无断言）：
 //   1 | mount namespace | 沙箱内 cat /proc/self/mountinfo | 无宿主挂载
 //   2 | pivot_root       | 沙箱内 ls /                    | 只有 tmpfs 目录
-//   3 | umount 旧根      | 沙箱内 ls /tmp/sb-*            | 旧根不可达
+//   3 | umount 旧根      | mountinfo 无宿主挂载树         | 旧根挂载已卸载
 //   4 | MS_PRIVATE       | 宿主 mountinfo                 | 无 tmpfs 事件
 //   5 | cgroup 迁移      | 子进程启动后读 cgroup.procs     | PID 在目标 cgroup
 //
@@ -86,8 +86,6 @@ int main() {
           << "        closedir(d);\n"
           << "    }\n"
           << "    printf(\"ROOT_END\\n\");\n"
-          // --- 第 3 条：旧根是否可达 ---
-          << "    printf(\"OLDROOT_REACHABLE %d\\n\", access(\"/tmp/sb-rootfs-probe\", F_OK) == 0 ? 1 : 0);\n"
           // --- 第 1 条：沙箱内 mountinfo（完整转储，父进程解析）---
           << "    printf(\"MOUNTINFO_BEGIN\\n\");\n"
           << "    int fd = open(\"/proc/self/mountinfo\", O_RDONLY);\n"
@@ -160,9 +158,35 @@ int main() {
             if (line.rfind("ROOT_ENTRY ", 0) == 0) root_entries.push_back(line.substr(11));
         }
     }
-    auto oldroot_reachable = [&]() {
-        size_t p = out.find("OLDROOT_REACHABLE ");
-        return (p != std::string::npos && out[p + 18] == '1');
+    // 旧根是否仍挂载在沙箱内 mountinfo 中（第 3 条判定）
+    // 判决实验证据（2026-09-30 实测）：把 rootfs.cpp 的 umount2 禁用后，
+    // 宿主挂载树（/dev /run /sys /snap /mnt 等）全量出现在沙箱内 mountinfo；
+    // 正常情况只有 5 行（tmpfs + 3 个 bind + /proc）。
+    // 因此判别特征 = "挂载点字段命中 rootfs setup 从不创建的宿主一级目录"。
+    auto oldroot_mounted = [&]() {
+        std::istringstream iss(mi);
+        std::string line;
+        while (std::getline(iss, line)) {
+            // mountinfo 行格式：id parent maj:min root mountpoint opts - fstype src ...
+            // 第 5 字段 = 挂载点（实测：3457 3333 0:78 / / rw,... - tmpfs tmpfs ...）
+            std::istringstream ls(line);
+            std::string f;
+            std::vector<std::string> fields;
+            while (ls >> f) fields.push_back(f);
+            if (fields.size() < 5) continue;
+            const std::string& mp = fields[4];
+            // 宿主挂载树特征：rootfs setup 从不创建这些路径
+            // （/proc 排除：沙箱自己合法挂载了 /proc，会和宿主的 /proc 混淆）
+            static const char* oldroot_marks[] = {
+                "/dev", "/run", "/sys", "/snap", "/mnt", nullptr
+            };
+            for (int i = 0; oldroot_marks[i]; ++i) {
+                const std::string mark = oldroot_marks[i];
+                if (mp == mark || mp.rfind(mark + "/", 0) == 0)
+                    return true;  // 命中 → 旧根挂载仍在沙箱内
+            }
+        }
+        return false;
     };
 
     // ============================================================
@@ -191,12 +215,14 @@ int main() {
     }
 
     // ============================================================
-    // 第 3 条：umount 旧根 —— 旧根不可达
+    // 第 3 条：umount 旧根 —— 旧根挂载不得出现在沙箱内 mountinfo
+    // 判别：mountinfo 挂载点命中宿主一级目录（/dev /run /sys /snap /mnt）即旧根未卸载
+    // 反证：把 rootfs.cpp 的 umount2 改 return 0 → 本条断言变红（判决实验已验证）
     // ============================================================
-    if (!oldroot_reachable()) {
-        ok("【第3条 umount 旧根】旧根不可达（/tmp/sb-rootfs-* 不存在）");
+    if (!oldroot_mounted()) {
+        ok("【第3条 umount 旧根】旧根挂载不在沙箱内 mountinfo（已卸载）");
     } else {
-        bad("【第3条 umount 旧根】旧根仍可达（MNT_DETACH 未生效或漏卸）");
+        bad("【第3条 umount 旧根】旧根挂载仍在沙箱内 mountinfo（MNT_DETACH 未生效）");
     }
 
     // ============================================================
