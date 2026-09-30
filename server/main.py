@@ -22,17 +22,26 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# judge_main 可执行文件路径（构建产物，由 run_all.sh 的 CMake 构建产生）
+# 默认空串 + 启动时校验：不写死路径，clone 仓库的人必须自己配
+JUDGE_MAIN = os.environ.get("JUDGE_MAIN", "")
+
 app = FastAPI(title="OJ 判题 server（垂直切片）")
+
+# 启动时校验 JUDGE_MAIN（放在路由挂载之前，配错直接拒绝启动）
+if not JUDGE_MAIN:
+    raise RuntimeError(
+        "JUDGE_MAIN 未配置：请设置环境变量指向 judge_main 可执行文件，"
+        "例如 export JUDGE_MAIN=$PWD/sandbox/tests/smoke/build/judge_main"
+    )
+if not os.path.isfile(JUDGE_MAIN):
+    raise RuntimeError(f"JUDGE_MAIN 路径不存在或不是文件: {JUDGE_MAIN}")
 
 # 语言白名单（与计划 Wave 3 任务 3.4 的参数校验前置对齐）
 ALLOWED_LANGS = {"cpp", "c"}
 MAX_CODE_BYTES = 64 * 1024  # 64KB，与计划一致
 COMPILE_TIMEOUT_SEC = 30
 JUDGE_TIMEOUT_MS = 3000  # 判题墙钟（ms）
-
-# judge_main 可执行文件路径（构建产物，由 run_all.sh 的 CMake 构建产生）
-JUDGE_MAIN = os.environ.get("JUDGE_MAIN", "/home/china/work/dati/sandbox/tests/smoke/build/judge_main")
-
 
 class SubmitRequest(BaseModel):
     code: str
@@ -45,6 +54,10 @@ def compile_code(code: str, lang: str) -> str:
     为什么编译在沙箱外（架构决策，面试点）：
     - 编译器依赖大量 syscall 与头文件，沙箱内编译要么白名单过宽（等于不隔离），要么维护成本高
     - 运行用户二进制才是风险面，编译不是
+
+    清理职责（谁创建谁清理）：
+    - src_path 是本函数创建，本函数负责删——编译成功、失败、超时三条路径都不留源码
+    - bin_path 返回给调用方，由 submit() 的 finally 删（判题后清理）
     """
     src_path = f"/tmp/oj_{uuid.uuid4().hex}.{lang}"
     bin_path = f"/tmp/oj_{uuid.uuid4().hex}"
@@ -52,23 +65,42 @@ def compile_code(code: str, lang: str) -> str:
     with open(src_path, "w", encoding="utf-8") as f:
         f.write(code)
 
-    cmd = ["g++", "-O2", "-o", bin_path, src_path]
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=COMPILE_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=400, detail="编译超时（>30s）")
+        cmd = ["g++", "-O2", "-o", bin_path, src_path]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=COMPILE_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            # 超时也要清掉已写出的源码和可能的半成品二进制
+            for p in (src_path, bin_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            raise HTTPException(status_code=400, detail="编译超时（>30s）")
 
-    if proc.returncode != 0:
-        # 编译错误：把编译器输出回给用户（OJ 的标准行为）
-        raise HTTPException(
-            status_code=400,
-            detail=json.dumps({"status": "compile_error", "error": proc.stderr}),
-        )
+        if proc.returncode != 0:
+            # 编译错误：把编译器输出回给用户（OJ 的标准行为）
+            for p in (src_path,):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=400,
+                detail=json.dumps({"status": "compile_error", "error": proc.stderr}),
+            )
+    except BaseException:
+        # 任何异常路径都不留源码
+        try:
+            os.unlink(src_path)
+        except OSError:
+            pass
+        raise
 
     return bin_path
 

@@ -218,8 +218,12 @@ int main() {
     // 第 3 条：umount 旧根 —— 旧根挂载不得出现在沙箱内 mountinfo
     // 判别：mountinfo 挂载点命中宿主一级目录（/dev /run /sys /snap /mnt）即旧根未卸载
     // 反证：把 rootfs.cpp 的 umount2 改 return 0 → 本条断言变红（判决实验已验证）
+    // 前置：mi 为空（用户程序没取到 mountinfo）时 fail-closed 判 FAIL——
+    //      "没观测到"不是"观测合格"，空数据判 OK 就是把不确定标成已通过。
     // ============================================================
-    if (!oldroot_mounted()) {
+    if (mi.empty()) {
+        bad("【第3条 umount 旧根】未取到沙箱内 mountinfo，无法判定（前置条件失败）");
+    } else if (!oldroot_mounted()) {
         ok("【第3条 umount 旧根】旧根挂载不在沙箱内 mountinfo（已卸载）");
     } else {
         bad("【第3条 umount 旧根】旧根挂载仍在沙箱内 mountinfo（MNT_DETACH 未生效）");
