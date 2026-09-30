@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>OJ 判题（垂直切片）</title>
+  <style>
+    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 20px; }
+    textarea { width: 100%; height: 240px; font-family: monospace; font-size: 14px; }
+    .row { margin: 12px 0; }
+    button { padding: 8px 24px; font-size: 14px; cursor: pointer; }
+    #result { margin-top: 16px; white-space: pre-wrap; background: #f4f4f4; padding: 12px; border-radius: 4px; }
+    .meta { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>在线判题 · 垂直切片</h1>
+  <p class="meta">提交代码 → g++ 编译 → 沙箱判题 → 返回结果</p>
+
+  <form id="form">
+    <div class="row">
+      <select id="language">
+        <option value="cpp">C++</option>
+        <option value="c">C</option>
+      </select>
+    </div>
+    <textarea id="code" placeholder="// 在这里写代码">#include &lt;cstdio&gt;
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}</textarea>
+    <div class="row">
+      <button type="submit">提交</button>
+    </div>
+  </form>
+
+  <div id="result">（结果会显示在这里）</div>
+
+  <script>
+    const form = document.getElementById('form');
+    const result = document.getElementById('result');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      result.textContent = '判题中…';
+      try {
+        const resp = await fetch('/api/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: document.getElementById('code').value,
+            language: document.getElementById('language').value,
+          }),
+        });
+        const data = await resp.json();
+        // 垂直切片不做轮询：judge_main 是同步返回的
+        result.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        result.textContent = '请求失败: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
