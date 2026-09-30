@@ -65,6 +65,8 @@ int apply_runtime_filter() {
         SCMP_SYS(pwrite64),
         SCMP_SYS(readv),
         SCMP_SYS(writev),
+        SCMP_SYS(getdents64),         // readdir/opendir 枚举目录（test_10 暴露的缺口）
+        SCMP_SYS(faccessat2),         // access() 检查文件存在性（test_10 暴露的缺口）
 
         // === 信号 ===
         SCMP_SYS(rt_sigaction),

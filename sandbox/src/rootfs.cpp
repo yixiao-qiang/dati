@@ -95,10 +95,12 @@ int setup(const std::string& binary_path) {
     //    /lib/x86_64-linux-gnu/       ← bind mount（只读，libc/libgcc_s）
     //    /lib64/                      ← bind mount（只读，ld-linux 动态链接器）
     //    /usr/lib/x86_64-linux-gnu/   ← bind mount（只读，libstdc++）
+    //    /proc                        ← procfs 挂载点（用户程序可读 /proc/self/*）
     mkdir_p(new_root + "/bin");
     mkdir_p(new_root + "/lib/x86_64-linux-gnu");
     mkdir_p(new_root + "/lib64");
     mkdir_p(new_root + "/usr/lib/x86_64-linux-gnu");
+    mkdir_p(new_root + "/proc");
 
     // 5. 复制用户二进制到 /bin/prog
     std::string prog_path = new_root + "/bin/prog";
@@ -127,7 +129,19 @@ int setup(const std::string& binary_path) {
         }
     }
 
-    // 7. chdir 到新根，pivot_root
+    // 7. 挂载 /proc（只读）
+    //    面试要点：沙箱内读 /proc/self/* 是常见需求（如 mountinfo/status）；
+    //    配合 CLONE_NEWPID，这里看到的是新 pidns 的进程视图，不泄漏宿主进程。
+    //    MS_NOEXEC|MS_NODEV|MS_NOSUID 防止在 /proc 上执行/创建设备。
+    if (mount("proc", (new_root + "/proc").c_str(), "proc",
+              MS_NODEV | MS_NOEXEC | MS_NOSUID, nullptr) != 0) {
+        std::fprintf(stderr, "rootfs: 挂载 /proc 失败: %s\n", std::strerror(errno));
+        umount(new_root.c_str());
+        rmdir(new_root.c_str());
+        return -1;
+    }
+
+    // 8. chdir 到新根，pivot_root
     if (chdir(new_root.c_str()) != 0) {
         std::fprintf(stderr, "rootfs: chdir 失败: %s\n", std::strerror(errno));
         umount(new_root.c_str());
@@ -142,13 +156,13 @@ int setup(const std::string& binary_path) {
         return -1;
     }
 
-    // 8. 卸载旧根（MNT_DETACH 延迟卸载，防止旧根还有引用时 umount 失败）
+    // 9. 卸载旧根（MNT_DETACH 延迟卸载，防止旧根还有引用时 umount 失败）
     if (umount2(".", MNT_DETACH) != 0) {
-        std::fprintf(stderr, "rootfs: umount2 旧根失败: 隔离不完整拒绝继续\n", std::strerror(errno));
+        std::fprintf(stderr, "rootfs: umount2 旧根失败: %s（隔离不完整拒绝继续）\n", std::strerror(errno));
         return -1;
     }
 
-    // 9. chdir 到新根
+    // 10. chdir 到新根
     chdir("/");
 
     return 0;

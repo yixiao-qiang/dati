@@ -39,3 +39,7 @@ target_link_libraries(test_08_net_ PRIVATE sandbox)
 # 测试 09：pids.max fork 炸弹隔离（验收表第 10 条，隔离有效性关键项）
 add_executable(test_09_pids test_09_pids.cpp)
 target_link_libraries(test_09_pids PRIVATE sandbox)
+
+# 测试 10：隔离结构断言（验收表第 1/2/3/4/5 条）
+add_executable(test_10_isolation_struct test_10_isolation_struct.cpp)
+target_link_libraries(test_10_isolation_struct PRIVATE sandbox)
