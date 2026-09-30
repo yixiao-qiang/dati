@@ -21,5 +21,10 @@ target_include_directories(sandbox PUBLIC
 # 链接 libseccomp（seccomp-bpf 用户态库）
 target_link_libraries(sandbox PUBLIC seccomp)
 
+# 命令行判题入口（垂直切片用）：./judge_main <binary> <time_ms> <mem_mb> <output_mb>
+# 输出一行 JSON 到 stdout，供 server 子进程调用解析
+add_executable(judge_main src/judge_main.cpp)
+target_link_libraries(judge_main PRIVATE sandbox)
+
 # 子目录：冒烟测试
 add_subdirectory(tests/smoke)
