@@ -51,23 +51,28 @@ int64_t now_ms() {
 }
 
 // ================= 工具：JSON 字段提取（学习期简化）=================
-// 提取字符串字段："key":"value"
+// 提取字符串字段："key" : "value"（容忍冒号后空格——
+//  judge_main 输出 {"status": "OK"}，冒号后有空格，旧写法匹配不上）
 std::string json_str(const std::string& json, const std::string& key) {
-    std::string pat = "\"" + key + "\":\"";
+    std::string pat = "\"" + key + "\"";
     size_t p = json.find(pat);
     if (p == std::string::npos) return "";
     p += pat.size();
+    while (p < json.size() && (json[p] == ':' || json[p] == ' ')) ++p;  // 跳过 : 和空格
+    if (p >= json.size() || json[p] != '"') return "";
+    ++p;  // 跳过开引号
     size_t e = json.find('"', p);
     if (e == std::string::npos) return "";
     return json.substr(p, e - p);
 }
 
-// 提取数字字段："key":123
+// 提取数字字段："key":123（容忍冒号后空格）
 std::string json_num(const std::string& json, const std::string& key) {
-    std::string pat = "\"" + key + "\":";
+    std::string pat = "\"" + key + "\"";
     size_t p = json.find(pat);
     if (p == std::string::npos) return "";
     p += pat.size();
+    while (p < json.size() && (json[p] == ':' || json[p] == ' ')) ++p;  // 跳过 : 和空格
     size_t e = json.find_first_of(",}", p);
     if (e == std::string::npos) return "";
     return json.substr(p, e - p);
@@ -99,7 +104,11 @@ std::string unescape(const std::string& s) {
 // 编译 g++ 和运行 judge_main 复用同一个模式（DRY）
 // 返回：0=正常退出  1=超时被杀  -1=内部故障（pipe/fork 失败）
 // 输出：output（stdout 全文）、status_out（waitpid 状态）
+// capture_stderr：true=stderr 合并进管道（编译用，错误信息要捕获）；
+//                 false=stderr 继承父进程（运行 judge_main 用，
+//                       JSON 只从 stdout 读，自身 stderr 直接上 worker 日志）
 int run_capture(const std::vector<std::string>& argv, int timeout_ms,
+                bool capture_stderr,
                 std::string* output, int* status_out, std::string* err) {
     // ① 管道：子进程 stdout → 父进程
     int pipefd[2];
@@ -120,6 +129,7 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
     if (pid == 0) {
         // 子进程：stdout 重定向到管道写端，然后 exec 替换
         dup2(pipefd[1], STDOUT_FILENO);
+        if (capture_stderr) dup2(pipefd[1], STDERR_FILENO);  // 合并 stderr
         close(pipefd[0]);
         close(pipefd[1]);
         // vector<string> → char* 数组（execvp 需要，末尾 nullptr）
@@ -220,7 +230,8 @@ bool compile_code(const std::string& code, const std::string& lang,
 
     std::string output;
     int status = 0;
-    const int rc = run_capture(argv, 30000, &output, &status, err);
+    // capture_stderr=true：编译错误（g++ 写 stderr）必须捕获
+    const int rc = run_capture(argv, 30000, true, &output, &status, err);
 
     if (rc == -1) {             // 内部故障：管道/fork 失败
         unlink(src.c_str());
@@ -284,7 +295,8 @@ bool judge_code(const std::string& code, const std::string& language,
     std::string json;
     int status = 0;
     // 运行超时 = 判题限额 + 5s 余量（进程启动/收尾不计入用户墙钟）
-    const int rc = run_capture(argv, time_ms + 5000, &json, &status, err);
+    // capture_stderr=false：JSON 只从 stdout 读，judge_main 自身 stderr 直接上日志
+    const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err);
 
     unlink(bin.c_str());  // 谁创建谁清理：运行完删 bin
 

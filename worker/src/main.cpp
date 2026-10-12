@@ -17,7 +17,8 @@
 #include "judge.h"
 
 
-void process_one(worker::Queue& q, worker::Db& db,const worker::StreamMessage& m){
+void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
+                 const worker::StreamMessage& m) {
     std::string err, code, lang;
     bool found = false;
     if(!db.fetch_code(m.submission_id, &code, &lang, &err,&found)){
@@ -40,8 +41,13 @@ void process_one(worker::Queue& q, worker::Db& db,const worker::StreamMessage& m
     }
 
     worker::JudgeOutcome out;
-    out.status = worker::JudgeStatus::Accepted;
-    out.stdout_text = "Hello,World!\n";
+    // 真判题：编译(沙箱外 g++) + judge_main(沙箱内) → 填 out
+    // 限额学习期硬编码 1000ms/256MB/64MB —— 正式版应从 DB/题目表读取
+    if (!judge_code(code, lang, judge_main, 1000, 256, 64, &out, &err)) {
+        std::fprintf(stderr, "judge 内部故障(id=%lld): %s\n",
+                     (long long)m.submission_id, err.c_str());
+        return;  // 不 ACK —— 内部故障留 PEL 等重投
+    }
 
     if(!db.finish(m.submission_id,out.status,out.stdout_text,out.stderr_text,&err)){
         std::fprintf(stderr,"finish 失败(id=%lld):%s\n",(long long )m.submission_id,err.c_str());
@@ -87,7 +93,7 @@ int main() {
             continue;  // 连接层错误：不退出，下轮重试（生产会退避，学习期先继续）
         }
         for (const auto& m : msgs) {
-            process_one(q, db, m);
+            process_one(q, db, judge_main, m);
         }
     }
 
