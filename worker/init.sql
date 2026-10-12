@@ -33,3 +33,23 @@ CREATE TABLE IF NOT EXISTS submission (
 CREATE USER IF NOT EXISTS 'oj'@'localhost' IDENTIFIED BY 'oj123456';
 GRANT ALL PRIVILEGES ON oj.* TO 'oj'@'localhost';
 FLUSH PRIVILEGES;
+
+-- ============================================================
+-- Outbox 表（Wave 2 任务 2.8，台阶 3 用）
+--
+-- 解决的问题：判题写完 MySQL 后若直接"再发一条 Redis 通知"，
+-- 两步之间崩溃 → DB 是终态但前端永远等不到通知（不一致）。
+-- Outbox 把"要发的事件"与业务状态放同一事务落库，再由投递器
+-- 独立读出投递——本地事务 + 最终一致。
+--
+-- 为什么必须 delivered 标记：投递成功但不标 1 → 下次扫描重复投递。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS outbox (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    submission_id BIGINT NOT NULL,            -- 关联的提交
+    event VARCHAR(32) NOT NULL,               -- 事件类型：judged / failed
+    payload MEDIUMTEXT NULL,                  -- 事件内容（JSON 文本）
+    delivered TINYINT NOT NULL DEFAULT 0,     -- 0=待投递 1=已投递（防重复投递的唯一依据）
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_undelivered (delivered, id)       -- 投递器扫描：WHERE delivered=0 ORDER BY id
+) ENGINE=InnoDB;

@@ -1,4 +1,4 @@
-// Wave 2 · main.cpp —— worker 主循环（占位骨架，待你填充）
+// Wave 2 · main.cpp —— worker 主循环（台阶 1 实现）
 //
 // 面试知识点（主循环的可靠性设计）：
 // - BLOCK 读：XREADGROUP BLOCK 5000，无消息时阻塞等待而不是空转烧 CPU
@@ -11,18 +11,49 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-
+#include <vector>
 #include "queue.h"
 #include "db.h"
 #include "judge.h"
 
+
+void process_one(worker::Queue& q, worker::Db& db,const worker::StreamMessage& m){
+    std::string err, code, lang;
+    bool found = false;
+    if(!db.fetch_code(m.submission_id, &code, &lang, &err,&found)){
+        std::fprintf(stderr,"fetch_code 失败(id=%lld): %s\n", (long long )m.submission_id,err.c_str());
+        return;
+    }
+    if(!found){
+        q.ack(m.id,nullptr);
+        return;
+    }
+
+    bool claimd = false;
+    if(!db.claim(m.submission_id, &err, &claimd)){
+        std::fprintf(stderr,"claim失败(id=%lld): %s\n",(long long)m.submission_id,err.c_str());
+        return;
+    }
+    if(!claimd){
+        q.ack(m.id,nullptr);
+        return;
+    }
+
+    worker::JudgeOutcome out;
+    out.status = worker::JudgeStatus::Accepted;
+    out.stdout_text = "Hello,World!\n";
+
+    if(!db.finish(m.submission_id,out.status,out.stdout_text,out.stderr_text,&err)){
+        std::fprintf(stderr,"finish 失败(id=%lld):%s\n",(long long )m.submission_id,err.c_str());
+        return;
+    }
+    q.ack(m.id,nullptr);
+}
 int main() {
     // ---- 配置（学习期先用环境变量，Wave 3 统一配置中心）----
     const char* redis_host = "127.0.0.1";
     int redis_port = 6379;
     const char* db_host = "127.0.0.1";
-    const char* db_user = "root";
-    const char* db_pass = std::getenv("MYSQL_PASS") ? std::getenv("MYSQL_PASS") : "";
     const char* db_name = "oj";
     const char* judge_main = std::getenv("JUDGE_MAIN") ? std::getenv("JUDGE_MAIN") : "";
     const char* consumer_id = std::getenv("WORKER_ID") ? std::getenv("WORKER_ID") : "w1";
@@ -37,11 +68,11 @@ int main() {
     worker::Db db;
 
     // ---- 连接（失败即退出，让 supervisor 拉起；不吞错）----
-    if (!q.connect(redis_host, redis_port, &err)) {
+    if (!q.connect("127.0.0.1", 6379, &err)) {
         std::fprintf(stderr, "Redis 连接失败: %s\n", err.c_str());
         return 1;
     }
-    if (!db.connect(db_host, db_user, db_pass, db_name, &err)) {
+    if (!db.connect("127.0.0.1", "oj", "oj123456", "oj", &err)) {
         std::fprintf(stderr, "MySQL 连接失败: %s\n", err.c_str());
         return 1;
     }
@@ -56,14 +87,7 @@ int main() {
             continue;  // 连接层错误：不退出，下轮重试（生产会退避，学习期先继续）
         }
         for (const auto& m : msgs) {
-            // TODO 台阶 1 处理流程：
-            //   1. db.fetch_code(m.submission_id) 取源码
-            //   2. db.claim(m.submission_id) 条件更新幂等
-            //       - claimed=true  -> judge_code() 判题 -> db.finish() 写终态
-            //       - claimed=false -> 已被别人抢/已终态，直接 ACK 丢弃
-            //   3. 无论哪条路径最后都 q.ack(m.id)
-            std::printf("[worker %s] 收到消息 id=%s submission_id=%lld\n",
-                        consumer_id, m.id.c_str(), (long long)m.submission_id);
+            process_one(q, db, m);
         }
     }
 

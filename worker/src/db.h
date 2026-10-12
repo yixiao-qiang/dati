@@ -58,8 +58,11 @@ public:
                 std::string* err);
 
     // 读回一条提交的代码与语言（worker 判题前取源码用）
+    // found 出参区分两种失败，语义不同不能混：
+    //   *found=false = 库里没有这条提交（脏消息，应 ACK 丢弃）
+    //   返回 false   = 数据库错误（不要 ACK，留 PEL 等重投）
     bool fetch_code(int64_t submission_id, std::string* code, std::string* language,
-                    std::string* err);
+                    std::string* err, bool* found);
 
 private:
     void* conn_ = nullptr;  // MYSQL*

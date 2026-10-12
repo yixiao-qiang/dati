@@ -14,11 +14,14 @@
 #include <cstdint>
 #include <string>
 
+#include "db.h"   // JudgeStatus 枚举（与 db.finish 对齐）
+
 namespace worker {
 
 // 判题结果（与 judge_main 输出的 JSON 字段对应）
 struct JudgeOutcome {
-    std::string status;      // OK / WA / TLE / MLE / RE / CE / INTERNAL_ERROR
+    worker::JudgeStatus status;  // 枚举：与 db.finish 的类型对齐
+                                 // （judge.cpp 解析 JSON 时做 "OK"→Accepted 映射）
     int exit_code = -1;
     int signal = 0;
     int64_t cpu_us = 0;
