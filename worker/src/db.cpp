@@ -330,4 +330,96 @@ bool Db::rescue_stale(int stale_minutes, int max_retry,
     return true;
 }
 
+bool Db::fetch_undelivered(int limit, std::vector<OutboxEntry>* out, std::string* err) {
+    out->clear();
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // ★ BEGIN：FOR UPDATE 的锁必须跨语句持有。
+    //   自动提交模式下锁随 SELECT 语句结束立即释放 → 两个投递器仍能拿到
+    //   同一行 → SKIP LOCKED 形同虚设。显式事务把"取行→投递→标记"串成
+    //   一个持锁区间，锁在 COMMIT/ROLLBACK 才释放。
+    if (mysql_query(c, "BEGIN") != 0) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+
+    char sql[256];
+    std::snprintf(sql, sizeof(sql),
+                  "SELECT id, submission_id FROM outbox WHERE delivered=0 "
+                  "ORDER BY id LIMIT %d FOR UPDATE SKIP LOCKED",
+                  limit);
+
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = mysql_error(c);
+        mysql_query(c, "ROLLBACK");  // 出错回滚，不残留事务态
+        return false;
+    }
+    MYSQL_RES* res = mysql_store_result(c);
+    if (!res) {
+        if (err) *err = mysql_error(c);
+        mysql_query(c, "ROLLBACK");
+        return false;
+    }
+
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        OutboxEntry e;
+        e.id = row[0] ? std::strtoll(row[0], nullptr, 10) : 0;
+        e.submission_id = row[1] ? std::strtoll(row[1], nullptr, 10) : 0;
+        out->push_back(e);
+    }
+    mysql_free_result(res);
+
+    if (out->empty()) {
+        // 没拿到行就没有锁可持，立即结束事务（避免空事务挂着连接）
+        mysql_query(c, "COMMIT");
+    }
+    // 非空：锁保持，等调用方 mark_delivered（COMMIT）或 rollback（释放）
+    return true;
+}
+
+bool Db::mark_delivered(int64_t outbox_id, std::string* err) {
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // 条件更新：WHERE delivered=0 保证"标记"幂等（重复标记影响 0 行）。
+    // 注意这里不检查 affected 行数：XADD 已成功，即使行已被别人标记
+    // （不可能——FOR UPDATE 锁挡住了），事务也要正常结束。
+    char sql[128];
+    std::snprintf(sql, sizeof(sql),
+                  "UPDATE outbox SET delivered=1 WHERE id=%lld AND delivered=0",
+                  (long long)outbox_id);
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+
+    // ★ COMMIT：结束 fetch_undelivered 开启的事务，释放 FOR UPDATE 锁。
+    if (mysql_query(c, "COMMIT") != 0) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+    return true;
+}
+
+bool Db::rollback(std::string* err) {
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    // XADD 失败路径：回滚释放 FOR UPDATE 锁，下轮投递器重试。
+    if (mysql_query(static_cast<MYSQL*>(conn_), "ROLLBACK") != 0) {
+        if (err) *err = mysql_error(static_cast<MYSQL*>(conn_));
+        return false;
+    }
+    return true;
+}
+
 }  // namespace worker

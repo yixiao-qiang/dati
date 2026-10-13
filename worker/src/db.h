@@ -78,6 +78,31 @@ public:
                       std::vector<int64_t>* dead_ids,
                       std::string* err);
 
+    // ---- 台阶 4：Outbox 投递器（本地消息表 + SKIP LOCKED）----
+
+    // 一条待投递的 outbox 事件（server 事务里写入，投递器负责送进 Redis）
+    struct OutboxEntry {
+        int64_t id;             // outbox 主键（mark_delivered 用）
+        int64_t submission_id;  // 载荷：关联的提交
+    };
+
+    // 取待投递（delivered=0）的 outbox 行，最多 limit 条。
+    // ★ SELECT ... FOR UPDATE SKIP LOCKED：
+    //   FOR UPDATE 锁住选中的行（本事务处理期间别人拿不到）；
+    //   SKIP LOCKED 跳过已被其他事务锁住的行（不等待）。
+    //   多投递器并发时各拿各的行 → 不重复投递；且不阻塞。
+    // 返回 0..n 行；无待投递返回空 vector（不是错误）；失败返回 false。
+    bool fetch_undelivered(int limit, std::vector<OutboxEntry>* out, std::string* err);
+
+    // 标记已投递：UPDATE outbox SET delivered=1 WHERE id=? AND delivered=0
+    // 条件更新幂等：重复标记影响 0 行，无害。内部 COMMIT 释放 FOR UPDATE 锁。
+    bool mark_delivered(int64_t outbox_id, std::string* err);
+
+    // 回滚 outbox 取行事务（XADD 失败时调用：释放 FOR UPDATE 锁，下轮重试）。
+    // ★ 为什么需要：fetch_undelivered 的锁靠显式事务跨语句持有，
+    //   投递失败必须 ROLLBACK 释放，否则锁持有到连接关闭/事务超时。
+    bool rollback(std::string* err);
+
 private:
     void* conn_ = nullptr;  // MYSQL*
 };

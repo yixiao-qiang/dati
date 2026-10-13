@@ -32,6 +32,8 @@ constexpr int64_t kBlockMs = 5000;         // 无消息时阻塞等待
 constexpr int64_t kRescueScanMs = 60000;   // 每 60s 扫一次卡死任务
 constexpr int kRescueStaleMin = 10;        // judging 超时阈值（与判死阈值 10min 对齐）
 constexpr int kRescueMaxRetry = 3;         // 重试上限，超限转死信等人工
+// 台阶 4：Outbox 投递器（本地消息表 → Redis Stream）
+constexpr int64_t kOutboxScanMs = 2000;    // 每 2s 扫一次待投递消息
 
 // 单调时钟（CLOCK_MONOTONIC）：不受系统改时间影响，只用于"过了多久"
 int64_t now_ms() {
@@ -111,9 +113,10 @@ int main() {
 
     // ---- 主循环 ----
     // 扫描时间点初始化为 0：启动后**立即**扫一次（重启的 worker 应马上接管
-    // 死任务/卡死任务，而不是等满一个周期才恢复）
-    int64_t last_claim_scan_ms = 0;   // 上次扫死任务的时间点
-    int64_t last_rescue_scan_ms = 0;  // 上次扫卡死任务的时间点
+    // 死任务/卡死任务/待投递消息，而不是等满一个周期才恢复）
+    int64_t last_claim_scan_ms = 0;    // 上次扫死任务的时间点
+    int64_t last_rescue_scan_ms = 0;   // 上次扫卡死任务的时间点
+    int64_t last_outbox_scan_ms = 0;   // 上次扫待投递消息的时间点
     while (true) {
         // ---- 台阶 2：周期扫描死任务（XAUTOCLAIM 判死接管）----
         // 时机：每 5s 一次。被接管的消息走与正常消息完全相同的流程
@@ -171,6 +174,40 @@ int main() {
             }
         }
 
+        // ---- 台阶 4：周期投递 Outbox（本地消息表 → Redis Stream）----
+        // 解决双写一致性：server 事务里写 submission + outbox（原子），
+        // 本投递器负责把 outbox 里的待发消息送进 Stream。
+        // 为什么需要 outbox：直接 XADD 的话，"DB 写成功 + Redis 写失败"时
+        // 任务卡 pending 无人消费（rescue 只捞 judging 不捞 pending）。
+        // 时机：每 2s 一次（提交到出队延迟 ≈2s，用户体验可接受）
+        if (now_ms() - last_outbox_scan_ms >= kOutboxScanMs) {
+            last_outbox_scan_ms = now_ms();
+            std::vector<worker::Db::OutboxEntry> events;
+            if (db.fetch_undelivered(10, &events, &err)) {
+                for (const auto& e : events) {
+                    std::string mid = q.produce(e.submission_id, &err);
+                    if (mid.empty()) {
+                        std::fprintf(stderr, "outbox 投递失败(outbox_id=%lld): %s\n",
+                                     (long long)e.id, err.c_str());
+                        // 释放 FOR UPDATE 锁：这批行留给下轮重试
+                        db.rollback(nullptr);
+                        break;
+                    }
+                    if (!db.mark_delivered(e.id, &err)) {
+                        std::fprintf(stderr, "outbox 标记失败(outbox_id=%lld): %s\n",
+                                     (long long)e.id, err.c_str());
+                        db.rollback(nullptr);
+                        break;
+                    }
+                    std::fprintf(stderr, "[outbox] 已投递 submission=%lld (outbox_id=%lld) msg=%s\n",
+                                 (long long)e.submission_id, (long long)e.id, mid.c_str());
+                }
+            } else {
+                std::fprintf(stderr, "fetch_undelivered 失败: %s\n", err.c_str());
+                // 不退出：投递失败下轮再试（消息还在 outbox，不丢）
+            }
+        }
+
         // ---- 正常消费 ----
         std::vector<worker::StreamMessage> msgs;
         if (!q.consume(consumer_id, kBlockMs, &msgs, &err)) {
@@ -191,6 +228,7 @@ int main() {
             process_one(q, db, judge_main, m);
         }
     }
+    constexpr int64_t kOutboxScanMs = 2000;
 
     return 0;
 }
