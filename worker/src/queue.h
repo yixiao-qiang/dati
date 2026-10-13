@@ -51,6 +51,20 @@ public:
     // 面试点：不 ACK = 消息永远挂 PEL = 10 分钟后被 XAUTOCLAIM 当死任务重投
     bool ack(const std::string& msg_id, std::string* err);
 
+    // ---- 台阶 2：崩溃恢复（XAUTOCLAIM 判死 + XCLAIM 心跳，必须成对）----
+
+    // 接管死任务：XAUTOCLAIM 把 idle 超过 min_idle_ms 的 pending 消息转移给本 consumer
+    // 返回 0..n 条消息；无死任务返回空 vector（不是错误）；失败返回 false 并填 err。
+    // 面试点：判死负责"把死任务捞回来"，心跳负责"证明活任务没死"——
+    // 只有判死会误杀慢任务，只有心跳死任务永远卡 PEL。
+    bool claim_idle(const std::string& consumer_id, int64_t min_idle_ms,
+                    std::vector<StreamMessage>* out, std::string* err);
+
+    // 心跳续命：XCLAIM 把指定消息 idle 重置为 0（"刚刚投递"），
+    // 防止长任务被 XAUTOCLAIM 误判死。失败返回 false 并填 err。
+    bool reset_idle(const std::string& consumer_id, const std::string& msg_id,
+                    std::string* err);
+
 private:
     void* ctx_ = nullptr;  // redisContext*（前向声明避免把头文件暴露给 hiredis）
 };

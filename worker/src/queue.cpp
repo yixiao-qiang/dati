@@ -223,4 +223,116 @@ bool Queue::ack(const std::string& msg_id, std::string* err) {
     return true;
 }
 
+namespace {
+
+// XAUTOCLAIM 返回两层嵌套数组：
+//   [0] = 下次扫描游标（字符串，学习期不保存，每轮从 0 重扫）
+//   [1] = 被接管消息数组（元素结构与 XREADGROUP 的消息一致）：
+//         [i][0] = 消息 ID
+//         [i][1] = 字段/值对（["submission_id", "123"]）
+// 注意与 parse_consume_reply 的外层结构不同：
+//   consume 是 [流名, [消息]]，claim 是 [游标, [消息]]——元素[0] 含义不同，
+//   所以不能复用 consume 的解析（它会拿游标当流名去剥层）。
+void parse_claim_reply(const redisReply* r, std::vector<StreamMessage>* out) {
+    if (r->type != REDIS_REPLY_ARRAY || r->elements < 2) {
+        return;  // 格式异常/无消息：不是错误
+    }
+    const redisReply* msgs = r->element[1];
+    if (msgs->type != REDIS_REPLY_ARRAY) {
+        return;
+    }
+    // 以下逐条解析与 consume 完全一致（同一消息结构）
+    for (size_t i = 0; i < msgs->elements; ++i) {
+        const redisReply* m = msgs->element[i];
+        if (m->type != REDIS_REPLY_ARRAY || m->elements < 2) continue;
+        const redisReply* id_r = m->element[0];
+        const redisReply* fields = m->element[1];
+        if (id_r->type != REDIS_REPLY_STRING) continue;
+        if (fields->type != REDIS_REPLY_ARRAY) continue;
+
+        StreamMessage msg;
+        msg.id = id_r->str ? id_r->str : "";
+        for (size_t j = 0; j + 1 < fields->elements; j += 2) {
+            const redisReply* k = fields->element[j];
+            const redisReply* v = fields->element[j + 1];
+            if (k->type != REDIS_REPLY_STRING || v->type != REDIS_REPLY_STRING) continue;
+            if (std::strcmp(k->str, "submission_id") == 0) {
+                msg.submission_id = v->str ? std::strtoll(v->str, nullptr, 10) : 0;
+                break;
+            }
+        }
+        out->push_back(msg);
+    }
+}
+
+}  // namespace
+
+bool Queue::claim_idle(const std::string& consumer_id, int64_t min_idle_ms,
+                       std::vector<StreamMessage>* out, std::string* err) {
+    if (!ctx_) {
+        if (err) *err = "未连接 Redis";
+        return false;
+    }
+    out->clear();
+    redisContext* c = static_cast<redisContext*>(ctx_);
+    // XAUTOCLAIM key group consumer min-idle-time start [COUNT count]
+    //   - min-idle-time：判死阈值（毫秒）——PEL 中 idle 超过它的消息才被接管
+    //   - start=0：从 PEL 头部开始扫。学习期每轮从 0 重扫（被接管的消息要么
+    //     ACK 移出 PEL 要么已归本 consumer，重扫代价低）；生产应保存返回的
+    //     游标，避免每次都扫已处理区域
+    //   - COUNT 10：一次最多接管 10 条，与 consume 批量一致
+    redisReply* r = static_cast<redisReply*>(redisCommand(
+        c, "XAUTOCLAIM %s %s %s %lld 0 COUNT 10",
+        kStream, kGroup, consumer_id.c_str(), (long long)min_idle_ms));
+    if (r == nullptr) {
+        if (err) *err = std::string("XAUTOCLAIM 失败: ") + c->errstr;
+        return false;
+    }
+    if (r->type == REDIS_REPLY_ERROR) {
+        if (err) *err = std::string("XAUTOCLAIM 错误: ") + r->str;
+        freeReplyObject(r);
+        return false;
+    }
+    if (r->type != REDIS_REPLY_ARRAY || r->elements < 2) {
+        if (err) *err = "XAUTOCLAIM 返回格式异常（非 [游标, 消息]）";
+        freeReplyObject(r);
+        return false;
+    }
+    parse_claim_reply(r, out);
+    freeReplyObject(r);
+    return true;
+}
+
+bool Queue::reset_idle(const std::string& consumer_id, const std::string& msg_id,
+                       std::string* err) {
+    if (!ctx_) {
+        if (err) *err = "未连接 Redis";
+        return false;
+    }
+    redisContext* c = static_cast<redisContext*>(ctx_);
+    // XCLAIM key group consumer min-idle-time id [IDLE ms]
+    //   - min-idle-time=0：不管消息当前 idle 多少都执行接管——
+    //     这是给自己的消息续命，不是抢别人的，条件放宽到 0
+    //   - IDLE 0：把 idle 重置为 0（"刚刚投递"）。不写 IDLE 参数时
+    //     XCLAIM 默认也重置 idle 为 0，这里显式写出意图，读代码的人
+    //     一眼知道"这是心跳不是接管"
+    //   - 语义：告诉 XAUTOCLAIM "我还在处理这条消息，别判我死"
+    redisReply* r = static_cast<redisReply*>(redisCommand(
+        c, "XCLAIM %s %s %s 0 %s IDLE 0",
+        kStream, kGroup, consumer_id.c_str(), msg_id.c_str()));
+    if (r == nullptr) {
+        if (err) *err = std::string("XCLAIM 失败: ") + c->errstr;
+        return false;
+    }
+    if (r->type == REDIS_REPLY_ERROR) {
+        if (err) *err = std::string("XCLAIM 错误: ") + r->str;
+        freeReplyObject(r);
+        return false;
+    }
+    // 返回被接管消息数组。消息不在 PEL（已被 ACK/被他人接管）时返回空数组
+    // ——不是错误（幂等要求重复心跳安全）。
+    freeReplyObject(r);
+    return true;
+}
+
 }  // namespace worker
