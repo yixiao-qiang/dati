@@ -11,6 +11,7 @@
 // - 谁创建谁清理：src/bin 都是本文件创建的临时文件，本文件负责删除
 
 #include "judge.h"
+#include "internal.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,20 +29,6 @@
 namespace worker {
 
 namespace {
-
-// ================= 工具：status string → 枚举 =================
-// judge_main 输出 "OK"/"WA"/"TLE"...，映射到 db.h 的枚举（与 finish 对齐）
-// 未知字符串 → SystemError（fail-closed：读不懂就当系统错误，不猜）
-JudgeStatus parse_status(const std::string& s) {
-    if (s == "OK")              return JudgeStatus::Accepted;
-    if (s == "WA")              return JudgeStatus::WrongAnswer;
-    if (s == "TLE")             return JudgeStatus::TimeLimit;
-    if (s == "MLE")             return JudgeStatus::MemoryLimit;
-    if (s == "RE")              return JudgeStatus::RuntimeError;
-    if (s == "CE")              return JudgeStatus::CompileError;
-    if (s == "INTERNAL_ERROR")  return JudgeStatus::SystemError;
-    return JudgeStatus::SystemError;
-}
 
 // 当前墙钟（毫秒）——超时判断用
 int64_t now_ms() {
@@ -299,6 +286,20 @@ bool compile_code(const std::string& code, const std::string& lang,
 }
 
 }  // namespace
+
+// ---- D4 导出：内部纯函数（声明见 internal.h，供单元测试）----
+// judge_main 输出 "OK"/"WA"/"TLE"...，映射到 db.h 的枚举（与 finish 对齐）
+// 未知字符串 → SystemError（fail-closed：读不懂就当系统错误，不猜）
+JudgeStatus parse_status(const std::string& s) {
+    if (s == "OK")              return JudgeStatus::Accepted;
+    if (s == "WA")              return JudgeStatus::WrongAnswer;
+    if (s == "TLE")             return JudgeStatus::TimeLimit;
+    if (s == "MLE")             return JudgeStatus::MemoryLimit;
+    if (s == "RE")              return JudgeStatus::RuntimeError;
+    if (s == "CE")              return JudgeStatus::CompileError;
+    if (s == "INTERNAL_ERROR")  return JudgeStatus::SystemError;
+    return JudgeStatus::SystemError;
+}
 
 // ================= 主函数：编译 + 运行 + 解析 =================
 bool judge_code(const std::string& code, const std::string& language,

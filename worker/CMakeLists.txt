@@ -35,3 +35,18 @@ add_executable(judge_worker
 #   mysqlclient - MySQL C API（头文件 <mysql/mysql.h>，系统默认 include 路径）
 #   两者均为 apt 包：libhiredis-dev / libmysqlclient-dev
 target_link_libraries(judge_worker PRIVATE hiredis mysqlclient)
+
+# ---- 单元测试（D4）：worker 内部纯函数 ----
+# 为什么单独建 worker_tests 目标而不是塞进 judge_worker：
+#   - 测试只测 db/judge 的内部纯函数（见 src/internal.h），不碰 Redis——
+#     单独目标就不必链接 hiredis，测试可离线运行；
+#   - 生产二进制（judge_worker）和测试各自独立构建，互不影响。
+# 运行：./build/worker_tests；退出码 0=全过，非 0=有失败（stderr 有 FAIL 行）。
+add_executable(worker_tests
+    tests/test_worker.cpp
+    src/db.cpp
+    src/judge.cpp
+)
+# 只需 mysqlclient：escape_sql 的真实转义测试用 mysql_init 句柄；
+# db.cpp/judge.cpp 的其余函数不引用 hiredis。
+target_link_libraries(worker_tests PRIVATE mysqlclient)

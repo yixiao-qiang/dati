@@ -19,6 +19,7 @@
 //   错误覆盖的发生点。
 
 #include "db.h"
+#include "internal.h"
 
 #include <mysql/mysql.h>
 
@@ -33,6 +34,10 @@ namespace {
 // stdout/stderr 入库前截断阈值：MEDIUMTEXT 有 16MB 空间，但一条判题输出
 // 存 64KB 足够排查，且防止恶意程序刷爆存储与回显带宽。
 constexpr size_t kMaxStoredBytes = 64 * 1024;
+
+}  // namespace
+
+// ---- D4 导出：内部纯函数（声明见 internal.h，供单元测试）----
 
 // 按 UTF-8 字符边界截断。
 // 为什么不能直接 substr(0, N)：用户程序输出可能含多字节 UTF-8，
@@ -59,8 +64,6 @@ std::string escape_sql(void* conn, const std::string& raw) {
     out.resize(n);
     return out;
 }
-
-}  // namespace
 
 const char* judge_status_to_string(JudgeStatus s) {
     switch (s) {
