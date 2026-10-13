@@ -25,8 +25,17 @@
 //   （太短：慢任务被误判死 → 重复投递；太长：死任务恢复慢 → 用户等不了）
 // 接管扫描周期 5s：主循环每轮检查、到点才扫，避免每轮都发 XAUTOCLAIM
 //   （Redis 往返有成本；判死阈值 10min，早几秒晚几秒无差别）
-constexpr int64_t kClaimIdleMs = 600000;   // 10min 判死阈值
-constexpr int64_t kClaimScanMs = 5000;     // 每 5s 扫一次死任务
+// ★ N3：kClaimIdleMs/kClaimScanMs 支持环境变量覆盖（默认正式值）。
+//   为什么：验证脚本要压缩时间尺度（判死 1s/扫描 500ms），若靠改源码，脚本
+//   只改不还原 → 忘记改回就提交 → 生产判死阈值变 1s → 每次判题都触发重复
+//   投递风暴。环境变量让测试只影响本次运行，不污染源码。
+static int64_t env_int64(const char* name, int64_t fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return fallback;
+    return std::strtoll(v, nullptr, 10);
+}
+const int64_t kClaimIdleMs = env_int64("OJ_CLAIM_IDLE_MS", 600000);   // 10min 判死阈值
+const int64_t kClaimScanMs = env_int64("OJ_CLAIM_SCAN_MS", 5000);     // 每 5s 扫一次死任务
 constexpr int64_t kBlockMs = 5000;         // 无消息时阻塞等待
 // 台阶 3：rescue 扫描（judging 卡死 → pending 重新入队 / 死信）
 constexpr int64_t kRescueScanMs = 60000;   // 每 60s 扫一次卡死任务
@@ -44,7 +53,7 @@ int64_t now_ms() {
 
 
 void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
-                 const worker::StreamMessage& m) {
+                 const char* consumer_id, const worker::StreamMessage& m) {
     std::string err, code, lang;
     bool found = false;
     if(!db.fetch_code(m.submission_id, &code, &lang, &err,&found)){
@@ -69,7 +78,11 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     worker::JudgeOutcome out;
     // 真判题：编译(沙箱外 g++) + judge_main(沙箱内) → 填 out
     // 限额学习期硬编码 1000ms/256MB/64MB —— 正式版应从 DB/题目表读取
-    if (!judge_code(code, lang, judge_main, 1000, 256, 64, &out, &err)) {
+    // ★ D3：判题循环内周期心跳——judge_code 阻塞期间 run_capture 每 30s 调
+    //   一次回调 reset_idle，防止长任务（未来大工程编译/判题机负载高）消息
+    //   idle 涨过 10min 判死阈值被误判死。主循环此刻被阻塞，只有回调能续命。
+    if (!judge_code(code, lang, judge_main, 1000, 256, 64, &out, &err,
+                    [&] { q.reset_idle(consumer_id, m.id, nullptr); })) {
         std::fprintf(stderr, "judge 内部故障(id=%lld): %s\n",
                      (long long)m.submission_id, err.c_str());
         return;  // 不 ACK —— 内部故障留 PEL 等重投
@@ -130,7 +143,7 @@ int main() {
                 for (const auto& m : dead) {
                     std::fprintf(stderr, "[worker %s] 接管死任务 id=%s (submission=%lld)\n",
                                  consumer_id, m.id.c_str(), (long long)m.submission_id);
-                    process_one(q, db, judge_main, m);
+                    process_one(q, db, judge_main, consumer_id, m);
                 }
             } else {
                 std::fprintf(stderr, "claim_idle 失败: %s\n", err.c_str());
@@ -248,7 +261,7 @@ int main() {
                              m.id.c_str(), err.c_str());
                 // 不中断处理：心跳失败不致命，DB 幂等是最后防线
             }
-            process_one(q, db, judge_main, m);
+            process_one(q, db, judge_main, consumer_id, m);
         }
     }
 

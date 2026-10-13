@@ -1,10 +1,14 @@
 #!/bin/bash
 # 台阶 2 崩溃恢复验证 —— B 层：端到端（worker 自动接管 + 完整判题）
-# 前提：main.cpp 已临时压缩 kClaimIdleMs=1000(1s)、kClaimScanMs=500(500ms)
+# 时间尺度压缩通过环境变量完成（N3），无需改源码：
+#   OJ_CLAIM_IDLE_MS=1000（1s 判死）+ OJ_CLAIM_SCAN_MS=500（500ms 扫描）
+#   worker 启动时从环境变量读取；环境变量只影响本次运行，不污染源码。
 # 场景：消息被读走不 ACK（模拟崩溃）→ 启动 worker
 #       → 500ms 内主循环扫到死任务 → XAUTOCLAIM 接管 → process_one 完整判题
 #       → DB 写终态 → XACK。全程无人工介入。
 
+export OJ_CLAIM_IDLE_MS=1000
+export OJ_CLAIM_SCAN_MS=500
 cd ~/work/dati/worker
 
 echo "========== 0. 插入新提交 =========="

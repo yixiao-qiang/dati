@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "db.h"   // JudgeStatus 枚举（与 db.finish 对齐）
@@ -38,10 +39,15 @@ struct JudgeOutcome {
 //   language  - cpp / c
 //   judge_main - judge_main 可执行文件路径（JUDGE_MAIN 环境变量，启动时校验）
 //   time_ms / mem_mb / output_mb - 判题限额
+//   heartbeat - 可选心跳回调（D3）：判题处理期间 run_capture 轮询循环每 30s
+//               调一次。长任务（编译/运行超过判死阈值 10min）靠它续命，
+//               防止消息 idle 涨过阈值被 XAUTOCLAIM 误判死——主循环在
+//               judge_code 里是阻塞的，只有回调有机会动 Redis。
 // 编译失败（CE）也通过 outcome.status="CE" 返回，不视为调用错误
 bool judge_code(const std::string& code, const std::string& language,
                 const std::string& judge_main,
                 int time_ms, int mem_mb, int output_mb,
-                JudgeOutcome* outcome, std::string* err);
+                JudgeOutcome* outcome, std::string* err,
+                const std::function<void()>& heartbeat = {});
 
 }  // namespace worker
