@@ -81,8 +81,18 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     // ★ D3：判题循环内周期心跳——judge_code 阻塞期间 run_capture 每 30s 调
     //   一次回调 reset_idle，防止长任务（未来大工程编译/判题机负载高）消息
     //   idle 涨过 10min 判死阈值被误判死。主循环此刻被阻塞，只有回调能续命。
+    // ★ M1：心跳失败必须留痕——reset_idle 失败说明"证明我活着"没做成；
+    //   若 Redis 连接已断，静默失败会让心跳在最需要它的时候失效且无迹可查
+    //   （违背"不吞错"纪律）。30s 一次，打日志不会刷屏。
+    std::string hb_err;
     if (!judge_code(code, lang, judge_main, 1000, 256, 64, &out, &err,
-                    [&] { q.reset_idle(consumer_id, m.id, nullptr); })) {
+                    [&] {
+                        hb_err.clear();
+                        if (!q.reset_idle(consumer_id, m.id, &hb_err)) {
+                            std::fprintf(stderr, "心跳失败(id=%s): %s\n",
+                                         m.id.c_str(), hb_err.c_str());
+                        }
+                    })) {
         std::fprintf(stderr, "judge 内部故障(id=%lld): %s\n",
                      (long long)m.submission_id, err.c_str());
         return;  // 不 ACK —— 内部故障留 PEL 等重投
@@ -200,7 +210,10 @@ int main() {
         // 本投递器负责把 outbox 里的待发消息送进 Stream。
         // 为什么需要 outbox：直接 XADD 的话，"DB 写成功 + Redis 写失败"时
         // 任务卡 pending 无人消费（rescue 只捞 judging 不捞 pending）。
-        // 时机：每 2s 一次（提交到出队延迟 ≈2s，用户体验可接受）
+        // 时机：每 2s 一次。★ N5：实际最坏投递延迟 ≈5s 而非 2s——
+        //   consume 的 BLOCK 5000 会阻塞主循环最长 5s，期间本投递检查不执行；
+        //   2s 是"投递器醒着的扫描周期"，5s 是"主循环被阻塞时的最坏等待"。
+        //   前端轮询间隔若按 2s 设计会有体感偏差，Wave 3 接前端时注意。
         if (now_ms() - last_outbox_scan_ms >= kOutboxScanMs) {
             last_outbox_scan_ms = now_ms();
             std::vector<worker::Db::OutboxEntry> events;
