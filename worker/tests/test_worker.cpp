@@ -111,13 +111,25 @@ void test_judge_status_to_string() {
     CHECK(std::string(worker::judge_status_to_string(JudgeStatus::SystemError)) == "system_error");
     CHECK(std::string(worker::judge_status_to_string(JudgeStatus::Dead)) == "dead");
 
-    // 往返一致性：DB 里存的是字符串，读回要能映射回同一枚举
-    //   （finish 写 st=to_string(status)，rescue 读 status 列按字符串匹配）
-    CHECK(worker::parse_status(worker::judge_status_to_string(JudgeStatus::Accepted)) == JudgeStatus::Accepted);
+    // 往返一致性（真实生产链路）：judge_main 输出 → parse_status → 枚举 →
+    //   judge_status_to_string → DB 字符串。
+    // ★ 注意：parse_status 与 judge_status_to_string **不是互逆函数**——
+    //   两套词汇表不同（judge_main 输出 "OK" vs DB 存 "accepted"），
+    //   parse_status 只认 judge_main 输出。旧断言
+    //   parse_status(judge_status_to_string(Accepted)) == Accepted 是错的
+    //   （VM 实测 FAIL，见提交记录），已修正为下方全链路断言。
+    // ★ 必须包 std::string(...) 再比较：judge_status_to_string 返回 const char*，
+    //   裸指针 == 字符串字面量是**指针地址比较**（不是内容比较）——"accepted"
+    //   恰好被字符串池合并到同地址所以碰巧 PASS，其余全部 FAIL（VM 实测教训）。
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("OK"))) == "accepted");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("WA"))) == "wrong_answer");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("TLE"))) == "tle");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("MLE"))) == "mle");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("RE"))) == "runtime_error");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("CE"))) == "compile_error");
+    CHECK(std::string(worker::judge_status_to_string(worker::parse_status("INTERNAL_ERROR"))) == "system_error");
+    // Dead：DB 侧状态，不在 parse_status 白名单 → SystemError（两层语义隔离）
     CHECK(worker::parse_status(worker::judge_status_to_string(JudgeStatus::Dead)) == JudgeStatus::SystemError);
-    // 注意：Dead 字符串 "dead" 不在 parse_status 白名单里 → 落 SystemError，
-    //   这符合设计（parse_status 只认 judge_main 输出；dead 是 DB 侧状态，
-    //   不会从判题结果路径进来）。
 }
 
 }  // namespace
