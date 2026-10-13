@@ -157,8 +157,16 @@ int main() {
                 for (int64_t id : reset_ids) {
                     std::string mid = q.produce(id, &err);
                     if (mid.empty()) {
-                        std::fprintf(stderr, "rescue 重新入队失败(id=%lld): %s\n",
+                        // ★ P0-2：不能只打日志！此刻 DB 已是 pending 且消息已
+                        //   不在 PEL，rescue 的 SELECT 条件（judging 且超时）下
+                        //   一轮不会再选中它 → 任务永久卡 pending、无人消费。
+                        //   回滚成 judging（retry-1），让下一轮 rescue 重捞。
+                        std::fprintf(stderr, "rescue 重新入队失败(id=%lld): %s —— 回滚成 judging 等下一轮 rescue\n",
                                      (long long)id, err.c_str());
+                        if (!db.revert_reset(id, &err)) {
+                            std::fprintf(stderr, "revert_reset 失败(id=%lld): %s\n",
+                                         (long long)id, err.c_str());
+                        }
                     } else {
                         std::fprintf(stderr, "[rescue] id=%lld 重置 pending 并重新入队 msg=%s\n",
                                      (long long)id, mid.c_str());
@@ -184,23 +192,38 @@ int main() {
             last_outbox_scan_ms = now_ms();
             std::vector<worker::Db::OutboxEntry> events;
             if (db.fetch_undelivered(10, &events, &err)) {
+                bool batch_ok = true;
                 for (const auto& e : events) {
                     std::string mid = q.produce(e.submission_id, &err);
                     if (mid.empty()) {
                         std::fprintf(stderr, "outbox 投递失败(outbox_id=%lld): %s\n",
                                      (long long)e.id, err.c_str());
-                        // 释放 FOR UPDATE 锁：这批行留给下轮重试
+                        // 释放 FOR UPDATE 锁：这批行留给下轮重试（不 COMMIT）
                         db.rollback(nullptr);
+                        batch_ok = false;
                         break;
                     }
                     if (!db.mark_delivered(e.id, &err)) {
                         std::fprintf(stderr, "outbox 标记失败(outbox_id=%lld): %s\n",
                                      (long long)e.id, err.c_str());
                         db.rollback(nullptr);
+                        batch_ok = false;
                         break;
                     }
                     std::fprintf(stderr, "[outbox] 已投递 submission=%lld (outbox_id=%lld) msg=%s\n",
                                  (long long)e.submission_id, (long long)e.id, mid.c_str());
+                }
+                if (batch_ok && !events.empty()) {
+                    // ★ P0-1：整批统一 COMMIT（不是逐行）。
+                    //   mark_delivered 只 UPDATE 不 COMMIT，FOR UPDATE 锁跨整批
+                    //   持有——逐行 COMMIT 会让第一条就释放全部锁，另一投递器
+                    //   拿到同批剩余行 → 同一 submission 重复 XADD。
+                    if (!db.commit(&err)) {
+                        std::fprintf(stderr, "outbox 批量 COMMIT 失败: %s\n", err.c_str());
+                        // 已投递的行 delivered 未标记 → 下轮重扫会重复 XADD，
+                        // 由消费端 claim 条件更新幂等兜底（重复投递≠重复判题）
+                        db.rollback(nullptr);
+                    }
                 }
             } else {
                 std::fprintf(stderr, "fetch_undelivered 失败: %s\n", err.c_str());
@@ -228,7 +251,6 @@ int main() {
             process_one(q, db, judge_main, m);
         }
     }
-    constexpr int64_t kOutboxScanMs = 2000;
 
     return 0;
 }

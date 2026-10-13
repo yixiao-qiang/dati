@@ -73,6 +73,7 @@ const char* judge_status_to_string(JudgeStatus s) {
         case JudgeStatus::RuntimeError: return "runtime_error";
         case JudgeStatus::CompileError: return "compile_error";
         case JudgeStatus::SystemError:  return "system_error";
+        case JudgeStatus::Dead:         return "dead";
     }
     return "unknown";
 }
@@ -313,11 +314,15 @@ bool Db::rescue_stale(int stale_minutes, int max_retry,
             if (mysql_affected_rows(c) == 1) reset_ids->push_back(id);
         } else {
             // 重试超限 → 死信：不再自动捞，等人工介入（无限重试=资源黑洞）。
+            // ★ 用枚举映射而非裸字符串 'dead'（P1-2）：dead 已进 JudgeStatus
+            //   枚举，状态机只有枚举一种权威来源；裸字符串会让 API 层查这个
+            //   状态时只能拿到字符串或落到 unknown。
+            const std::string dead_st = judge_status_to_string(JudgeStatus::Dead);
             char up[256];
             std::snprintf(up, sizeof(up),
-                          "UPDATE submission SET status='dead' "
+                          "UPDATE submission SET status='%s' "
                           "WHERE id=%lld AND status='judging'",
-                          (long long)id);
+                          dead_st.c_str(), (long long)id);
             if (mysql_query(c, up) != 0) {
                 if (err) *err = mysql_error(c);
                 mysql_free_result(res);
@@ -390,8 +395,10 @@ bool Db::mark_delivered(int64_t outbox_id, std::string* err) {
     MYSQL* c = static_cast<MYSQL*>(conn_);
 
     // 条件更新：WHERE delivered=0 保证"标记"幂等（重复标记影响 0 行）。
-    // 注意这里不检查 affected 行数：XADD 已成功，即使行已被别人标记
-    // （不可能——FOR UPDATE 锁挡住了），事务也要正常结束。
+    // ★ P0-1 修复：本方法**不**结束事务（不 COMMIT）——FOR UPDATE 锁必须
+    //   跨整批持有。若逐行 COMMIT，第一条就释放全部锁，另一投递器 SKIP
+    //   LOCKED 不再跳过任何行 → 拿到同批剩余行 → 同一 submission 重复 XADD。
+    //   整批投递完成后由调用方统一 commit()；任一条失败 rollback()。
     char sql[128];
     std::snprintf(sql, sizeof(sql),
                   "UPDATE outbox SET delivered=1 WHERE id=%lld AND delivered=0",
@@ -400,10 +407,17 @@ bool Db::mark_delivered(int64_t outbox_id, std::string* err) {
         if (err) *err = mysql_error(c);
         return false;
     }
+    return true;
+}
 
-    // ★ COMMIT：结束 fetch_undelivered 开启的事务，释放 FOR UPDATE 锁。
-    if (mysql_query(c, "COMMIT") != 0) {
-        if (err) *err = mysql_error(c);
+bool Db::commit(std::string* err) {
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    // 整批投递完成：统一 COMMIT，释放 fetch_undelivered 持有的 FOR UPDATE 锁。
+    if (mysql_query(static_cast<MYSQL*>(conn_), "COMMIT") != 0) {
+        if (err) *err = mysql_error(static_cast<MYSQL*>(conn_));
         return false;
     }
     return true;
@@ -417,6 +431,31 @@ bool Db::rollback(std::string* err) {
     // XADD 失败路径：回滚释放 FOR UPDATE 锁，下轮投递器重试。
     if (mysql_query(static_cast<MYSQL*>(conn_), "ROLLBACK") != 0) {
         if (err) *err = mysql_error(static_cast<MYSQL*>(conn_));
+        return false;
+    }
+    return true;
+}
+
+bool Db::revert_reset(int64_t submission_id, std::string* err) {
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // P0-2 修复：rescue 重置 pending 后重新入队（XADD）失败时，把状态回滚成
+    // judging（retry_count 还原 -1），下一轮 rescue 的 SELECT（judging 且超时）
+    // 会重新选中它——否则状态停在 pending 且消息已不在 PEL，永久无人消费。
+    // WHERE status='pending' 防竞态：重置后若已被其他 worker claim 走
+    //   （status 已变 judging/终态），匹配 0 行，不误伤正在判题的任务。
+    char sql[256];
+    std::snprintf(sql, sizeof(sql),
+                  "UPDATE submission SET status='judging', retry_count=retry_count-1 "
+                  "WHERE id=%lld AND status='pending'",
+                  (long long)submission_id);
+
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = mysql_error(c);
         return false;
     }
     return true;

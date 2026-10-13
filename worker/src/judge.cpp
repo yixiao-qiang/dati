@@ -138,7 +138,16 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
         execvp(cargv[0], cargv.data());
-        _exit(127);  // ★ exec 失败才到这。用 _exit 不走 atexit/析构
+        // exec 失败才到这。★ 向 stderr 写 __EXEC_FAIL__ 标记：
+        //   父进程据此区分"编译器不存在/无执行权限"（环境故障）与
+        //   "用户代码 CE"（正常判题结果）——否则 g++ 缺失会被当成用户的
+        //   编译错误，误导排查（判 CE 而实际是 worker 环境故障）。
+        //   capture_stderr=true 时标记收进 output；false 时打到 worker 日志。
+        const std::string emsg =
+            std::string("__EXEC_FAIL__ ") + std::strerror(errno) + "\n";
+        ssize_t ign = write(STDERR_FILENO, emsg.data(), emsg.size());
+        (void)ign;
+        _exit(127);  // exec 失败的标准码。用 _exit 不走 atexit/析构
                      //   （fork 副本跑析构会 double-free）
     }
 
@@ -244,7 +253,20 @@ bool compile_code(const std::string& code, const std::string& lang,
         outcome->error_msg = "编译超时（>30s）";
         return true;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {  // CE
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        // ★ 区分"编译器启动失败"（环境故障）与"用户代码 CE"：
+        //   execvp 失败的子进程向 stderr 写 __EXEC_FAIL__ 标记（capture_stderr
+        //   把它收进 output）。g++/gcc 不存在或无执行权限 → SystemError，
+        //   而不是误导性的 CompileError（用户看到"编译错误"其实是环境故障）。
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127 &&
+            output.find("__EXEC_FAIL__") != std::string::npos) {
+            unlink(src.c_str());
+            unlink(bin.c_str());
+            outcome->status = JudgeStatus::SystemError;
+            outcome->error_msg = "编译器启动失败（g++/gcc 不存在或无执行权限）";
+            return true;
+        }
+        // 正常 CE：用户代码编译错误（g++ 返回非 0）
         if (compiler_stderr) *compiler_stderr = output;
         unlink(src.c_str());
         unlink(bin.c_str());

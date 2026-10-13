@@ -29,6 +29,8 @@ enum class JudgeStatus {
     RuntimeError,  // runtime_error
     CompileError,  // compile_error
     SystemError,   // system_error
+    Dead,          // dead         —— 重试超限转死信，人工介入（P1-2：补齐枚举，
+                   //               否则 dead 是枚举外隐式状态，API 层查不到）
 };
 
 const char* judge_status_to_string(JudgeStatus s);
@@ -92,16 +94,34 @@ public:
     //   SKIP LOCKED 跳过已被其他事务锁住的行（不等待）。
     //   多投递器并发时各拿各的行 → 不重复投递；且不阻塞。
     // 返回 0..n 行；无待投递返回空 vector（不是错误）；失败返回 false。
+    // ★ 本方法开启显式事务（BEGIN）：取行到投递的锁必须跨语句持有，
+    //   由调用方在整批完成后 commit() 或失败时 rollback() 结束。
     bool fetch_undelivered(int limit, std::vector<OutboxEntry>* out, std::string* err);
 
     // 标记已投递：UPDATE outbox SET delivered=1 WHERE id=? AND delivered=0
-    // 条件更新幂等：重复标记影响 0 行，无害。内部 COMMIT 释放 FOR UPDATE 锁。
+    // 条件更新幂等：重复标记影响 0 行，无害。
+    // ★ 本方法**不**结束事务（P0-1 修复）：FOR UPDATE 锁必须跨整批持有——
+    //   若逐行 COMMIT，第一条就释放全部锁，另一投递器 SKIP LOCKED 不再跳过
+    //   任何行 → 拿到同批剩余行 → 同一 submission 重复 XADD。整批结束见 commit()。
     bool mark_delivered(int64_t outbox_id, std::string* err);
+
+    // 整批投递完成：统一 COMMIT，释放本批 FOR UPDATE 锁。
+    // 与 rollback() 配对：成功路径 commit、失败路径 rollback，锁的生命周期
+    // 由调用方在"整批"粒度上决定，而不是逐行。
+    bool commit(std::string* err);
 
     // 回滚 outbox 取行事务（XADD 失败时调用：释放 FOR UPDATE 锁，下轮重试）。
     // ★ 为什么需要：fetch_undelivered 的锁靠显式事务跨语句持有，
     //   投递失败必须 ROLLBACK 释放，否则锁持有到连接关闭/事务超时。
     bool rollback(std::string* err);
+
+    // 撤销一次 rescue 重置：pending -> judging（retry_count 还原 -1）。
+    // 什么时候用（P0-2）：rescue 重置 pending 后重新入队（XADD）失败——
+    //   若状态停在 pending 且消息已不在 PEL，任务永久无人消费（rescue 只捞
+    //   judging，下轮扫描不会再选中它）。回滚成 judging 让下一轮 rescue 重捞。
+    // WHERE status='pending' 防竞态：重置后若已被其他 worker claim 走
+    //   （status 已变 judging/终态），匹配 0 行，不误伤。
+    bool revert_reset(int64_t submission_id, std::string* err);
 
 private:
     void* conn_ = nullptr;  // MYSQL*
