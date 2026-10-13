@@ -1,11 +1,13 @@
-// Wave 2 · main.cpp —— worker 主循环（台阶 1 实现）
+// Wave 2 · main.cpp —— worker 主循环（台阶 1-3 实现）
 //
 // 面试知识点（主循环的可靠性设计）：
 // - BLOCK 读：XREADGROUP BLOCK 5000，无消息时阻塞等待而不是空转烧 CPU
 // - 幂等防线：claim 影响行数=0 -> 直接 ACK 丢弃（消息重复但任务只判一次）
 // - 失败不 ACK：数据库错误时让消息留在 PEL，10 分钟后 XAUTOCLAIM 会重投
 //   —— 宁可延迟重试，不能静默丢任务
-// - 崩溃恢复（台阶 2 加）：worker 崩了 -> 消息挂 PEL -> XAUTOCLAIM 认领
+// - 崩溃恢复（台阶 2）：worker 崩了 -> 消息挂 PEL -> XAUTOCLAIM 认领
+// - 卡死恢复（台阶 3）：消息重投后 claim 只认 pending，judging 卡死要靠
+//   rescue 扫描重置回 pending；重试超限转死信等人工
 
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +28,10 @@
 constexpr int64_t kClaimIdleMs = 600000;   // 10min 判死阈值
 constexpr int64_t kClaimScanMs = 5000;     // 每 5s 扫一次死任务
 constexpr int64_t kBlockMs = 5000;         // 无消息时阻塞等待
+// 台阶 3：rescue 扫描（judging 卡死 → pending 重新入队 / 死信）
+constexpr int64_t kRescueScanMs = 60000;   // 每 60s 扫一次卡死任务
+constexpr int kRescueStaleMin = 10;        // judging 超时阈值（与判死阈值 10min 对齐）
+constexpr int kRescueMaxRetry = 3;         // 重试上限，超限转死信等人工
 
 // 单调时钟（CLOCK_MONOTONIC）：不受系统改时间影响，只用于"过了多久"
 int64_t now_ms() {
@@ -104,7 +110,10 @@ int main() {
                 consumer_id, redis_host, redis_port, db_host, db_name, judge_main);
 
     // ---- 主循环 ----
-    int64_t last_claim_scan_ms = now_ms();  // 上次扫死任务的时间点
+    // 扫描时间点初始化为 0：启动后**立即**扫一次（重启的 worker 应马上接管
+    // 死任务/卡死任务，而不是等满一个周期才恢复）
+    int64_t last_claim_scan_ms = 0;   // 上次扫死任务的时间点
+    int64_t last_rescue_scan_ms = 0;  // 上次扫卡死任务的时间点
     while (true) {
         // ---- 台阶 2：周期扫描死任务（XAUTOCLAIM 判死接管）----
         // 时机：每 5s 一次。被接管的消息走与正常消息完全相同的流程
@@ -123,6 +132,42 @@ int main() {
             } else {
                 std::fprintf(stderr, "claim_idle 失败: %s\n", err.c_str());
                 // 不退出：扫描失败不影响正常消费，下轮再试
+            }
+        }
+
+        // ---- 台阶 3：周期 rescue 扫描（judging 卡死 → pending / 死信）----
+        // 与 claim_idle 的分工：Redis 层管消息投递（PEL），DB 层管任务状态。
+        // 为什么需要：消息重投后 claim 只认 pending；若任务卡在 judging
+        // （worker 判题中 DB 断连 → finish 失败 → 消息重投 → claim 0 行被
+        // ACK），XAUTOCLAIM 救不了它——必须把 judging 重置回 pending。
+        // 时机：每 60s 一次（比 claim 扫描慢：判死阈值 10min，60s 粒度足够）
+        if (now_ms() - last_rescue_scan_ms >= kRescueScanMs) {
+            last_rescue_scan_ms = now_ms();
+            std::vector<int64_t> reset_ids, dead_ids;
+            if (db.rescue_stale(kRescueStaleMin, kRescueMaxRetry,
+                                &reset_ids, &dead_ids, &err)) {
+                // 重置的任务必须重新入队：
+                // 消息可能已不在 PEL（XAUTOCLAIM 可能先重投过、claim 0 行后
+                // 被 ACK）——不重新 XADD 的话，状态是 pending 但没人消费。
+                // 重复消息无害：claim 条件更新幂等挡住（另一条消息已处理时
+                // 影响 0 行 → ACK）。
+                for (int64_t id : reset_ids) {
+                    std::string mid = q.produce(id, &err);
+                    if (mid.empty()) {
+                        std::fprintf(stderr, "rescue 重新入队失败(id=%lld): %s\n",
+                                     (long long)id, err.c_str());
+                    } else {
+                        std::fprintf(stderr, "[rescue] id=%lld 重置 pending 并重新入队 msg=%s\n",
+                                     (long long)id, mid.c_str());
+                    }
+                }
+                for (int64_t id : dead_ids) {
+                    std::fprintf(stderr, "[rescue] id=%lld 重试超限转死信，等待人工介入\n",
+                                 (long long)id);
+                }
+            } else {
+                std::fprintf(stderr, "rescue_stale 失败: %s\n", err.c_str());
+                // 不退出：扫描失败下轮再试
             }
         }
 

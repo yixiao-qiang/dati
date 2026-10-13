@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace worker {
 
@@ -63,6 +64,19 @@ public:
     //   返回 false   = 数据库错误（不要 ACK，留 PEL 等重投）
     bool fetch_code(int64_t submission_id, std::string* code, std::string* language,
                     std::string* err, bool* found);
+
+    // rescue 扫描：找出 judging 超时（judge_started_at 早于 NOW()-stale_minutes）的任务
+    //   - retry_count < max_retry → 重置 pending + retry_count+1（让消息重投后能再次 claim）
+    //   - retry_count >= max_retry → 转 dead（死信，人工介入，不再自动捞）
+    // 参数用整数分钟而非 ISO 字符串：时间计算交给 MySQL（NOW() - INTERVAL），
+    // 整数无注入面、无需转义。
+    // 输出：reset_ids（已重置 pending，调用方必须重新入队——消息可能已不在 PEL）、
+    //       dead_ids（已转死信，不入队）
+    // 返回 false = 数据库错误（本次扫描作废，下轮重试）
+    bool rescue_stale(int stale_minutes, int max_retry,
+                      std::vector<int64_t>* reset_ids,
+                      std::vector<int64_t>* dead_ids,
+                      std::string* err);
 
 private:
     void* conn_ = nullptr;  // MYSQL*

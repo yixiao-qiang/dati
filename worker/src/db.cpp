@@ -252,4 +252,82 @@ bool Db::fetch_code(int64_t submission_id, std::string* code, std::string* langu
     return true;
 }
 
+bool Db::rescue_stale(int stale_minutes, int max_retry,
+                      std::vector<int64_t>* reset_ids,
+                      std::vector<int64_t>* dead_ids,
+                      std::string* err) {
+    reset_ids->clear();
+    dead_ids->clear();
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // 第一步：找出"judging 且超时"的任务（含 retry_count 供分类）
+    // 判定条件 = status='judging' AND judge_started_at < NOW() - INTERVAL
+    // 为什么是 judging 超时而不是全部卡住：pending 是正常待消费状态；
+    // judging 超时才是"worker 抢了但没判完"（崩溃/DB 卡死）的现场。
+    // stale_minutes 是整数 %d，无注入面。
+    char sql[256];
+    std::snprintf(sql, sizeof(sql),
+                  "SELECT id, retry_count FROM submission "
+                  "WHERE status='judging' AND judge_started_at < NOW() - INTERVAL %d MINUTE",
+                  stale_minutes);
+
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+    MYSQL_RES* res = mysql_store_result(c);
+    if (!res) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+
+    // 第二步：逐条分类处理。
+    // 为什么逐条 UPDATE 而不是一条 CASE WHEN：
+    //   - 分类（重试+1 vs 转死信）依赖每条自己的 retry_count，一条 SQL 要
+    //     CASE 嵌套，可读性差；超时任务罕见，逐条开销可忽略
+    // 每条 UPDATE 都带 WHERE status='judging'：复用"终态不可逆"防线——
+    //   SELECT 与 UPDATE 之间任务可能已被 finish 写终态（慢 worker 恰好在
+    //   超时边缘完成），affected==0 是良性（任务已处理），不加入结果列表。
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        const int64_t id = row[0] ? std::strtoll(row[0], nullptr, 10) : 0;
+        const int retry = row[1] ? std::atoi(row[1]) : 0;
+
+        if (retry < max_retry) {
+            // 重置 pending + retry_count 原子自增（记录"被判死过一次"）。
+            // 重置后消息重投（XAUTOCLAIM 或重新入队）才能再次 claim 成功。
+            char up[256];
+            std::snprintf(up, sizeof(up),
+                          "UPDATE submission SET status='pending', retry_count=retry_count+1 "
+                          "WHERE id=%lld AND status='judging'",
+                          (long long)id);
+            if (mysql_query(c, up) != 0) {
+                if (err) *err = mysql_error(c);
+                mysql_free_result(res);
+                return false;
+            }
+            if (mysql_affected_rows(c) == 1) reset_ids->push_back(id);
+        } else {
+            // 重试超限 → 死信：不再自动捞，等人工介入（无限重试=资源黑洞）。
+            char up[256];
+            std::snprintf(up, sizeof(up),
+                          "UPDATE submission SET status='dead' "
+                          "WHERE id=%lld AND status='judging'",
+                          (long long)id);
+            if (mysql_query(c, up) != 0) {
+                if (err) *err = mysql_error(c);
+                mysql_free_result(res);
+                return false;
+            }
+            if (mysql_affected_rows(c) == 1) dead_ids->push_back(id);
+        }
+    }
+    mysql_free_result(res);
+    return true;
+}
+
 }  // namespace worker
