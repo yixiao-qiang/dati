@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS submission (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,        -- 提交 ID（Redis 消息载荷）
     code MEDIUMTEXT NOT NULL,                    -- 用户源码（server 限制 64KB，MEDIUMTEXT 16MB 富余）
     language VARCHAR(16) NOT NULL DEFAULT 'cpp', -- 语言（白名单 cpp/c）
-    status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 状态机当前位置
+    status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 状态机当前位置（pending/judging/终态/dead 死信）
     judge_started_at DATETIME NULL,              -- worker 抢到任务的时刻（rescue 判死依据）
     retry_count INT NOT NULL DEFAULT 0,          -- 已被 rescue 重置次数（>=3 进死信）
     result VARCHAR(20) NULL,                     -- 终态结果（accepted/tle/mle/...，与终态 status 一致）

@@ -107,9 +107,13 @@ std::string unescape(const std::string& s) {
 // capture_stderr：true=stderr 合并进管道（编译用，错误信息要捕获）；
 //                 false=stderr 继承父进程（运行 judge_main 用，
 //                       JSON 只从 stdout 读，自身 stderr 直接上 worker 日志）
+// heartbeat（D3）：判题处理期间每 kHeartbeatIntervalMs 调一次的可选回调。
+//   为什么需要：run_capture 阻塞时主循环没有机会 reset_idle，长任务消息的
+//   idle 会涨过判死阈值被 XAUTOCLAIM 误判死；回调在轮询循环里周期续命。
 int run_capture(const std::vector<std::string>& argv, int timeout_ms,
                 bool capture_stderr,
-                std::string* output, int* status_out, std::string* err) {
+                std::string* output, int* status_out, std::string* err,
+                const std::function<void()>& heartbeat = {}) {
     // ① 管道：子进程 stdout → 父进程
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -138,13 +142,15 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
         for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
         execvp(cargv[0], cargv.data());
-        // exec 失败才到这。★ 向 stderr 写 __EXEC_FAIL__ 标记：
-        //   父进程据此区分"编译器不存在/无执行权限"（环境故障）与
-        //   "用户代码 CE"（正常判题结果）——否则 g++ 缺失会被当成用户的
-        //   编译错误，误导排查（判 CE 而实际是 worker 环境故障）。
+        // exec 失败才到这。★ 向 stderr 写 OJ_EXEC_FAIL 标记（两端夹不可打印
+        // 前缀 \x01）：父进程据此区分"编译器不存在/无执行权限"（环境故障）与
+        // "用户代码 CE"（正常判题结果）。
+        // ★ N1：\x01 前缀防用户注入——若裸写 "__EXEC_FAIL__"，用户源码一行
+        //   `#error __EXEC_FAIL__` 会让 g++ 把该串原样输出到 stderr → 误判成
+        //   SystemError（把编译错误伪装成环境故障）。\x01 用户源码几乎无法输出。
         //   capture_stderr=true 时标记收进 output；false 时打到 worker 日志。
         const std::string emsg =
-            std::string("__EXEC_FAIL__ ") + std::strerror(errno) + "\n";
+            std::string("\x01OJ_EXEC_FAIL\x01 ") + std::strerror(errno) + "\n";
         ssize_t ign = write(STDERR_FILENO, emsg.data(), emsg.size());
         (void)ign;
         _exit(127);  // exec 失败的标准码。用 _exit 不走 atexit/析构
@@ -163,6 +169,10 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
     int status = 0;
     bool done = false;
     bool timed_out = false;
+    // ★ D3：心跳周期 30s = 判死阈值 10min 的 1/20，容错余量充足；
+    //   回调内部是 Redis 往返，30s 一次的频率开销可忽略。
+    constexpr int64_t kHeartbeatIntervalMs = 30000;
+    int64_t last_heartbeat_ms = start;
 
     while (!done) {
         // ④ 非阻塞检查子进程状态
@@ -175,6 +185,13 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
             ssize_t n = read(pipefd[0], buf, sizeof(buf));
             if (n > 0) out.append(buf, static_cast<size_t>(n));
             else break;  // n==0 EOF；n<0 EAGAIN 或出错
+        }
+
+        // ★ D3：周期心跳（子进程还在跑才需要；done 后无需续命）。
+        //   run_capture 阻塞期间只有这里有机会执行回调。
+        if (!done && heartbeat && now_ms() - last_heartbeat_ms >= kHeartbeatIntervalMs) {
+            last_heartbeat_ms = now_ms();
+            heartbeat();
         }
 
         if (!done) {
@@ -255,11 +272,12 @@ bool compile_code(const std::string& code, const std::string& lang,
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         // ★ 区分"编译器启动失败"（环境故障）与"用户代码 CE"：
-        //   execvp 失败的子进程向 stderr 写 __EXEC_FAIL__ 标记（capture_stderr
-        //   把它收进 output）。g++/gcc 不存在或无执行权限 → SystemError，
-        //   而不是误导性的 CompileError（用户看到"编译错误"其实是环境故障）。
+        //   execvp 失败的子进程向 stderr 写 \x01OJ_EXEC_FAIL\x01 标记
+        //   （capture_stderr 把它收进 output，\x01 前缀防用户源码注入）。
+        //   g++/gcc 不存在或无执行权限 → SystemError，而不是误导性的
+        //   CompileError（用户看到"编译错误"其实是环境故障）。
         if (WIFEXITED(status) && WEXITSTATUS(status) == 127 &&
-            output.find("__EXEC_FAIL__") != std::string::npos) {
+            output.find("\x01OJ_EXEC_FAIL\x01") != std::string::npos) {
             unlink(src.c_str());
             unlink(bin.c_str());
             outcome->status = JudgeStatus::SystemError;
@@ -286,7 +304,8 @@ bool compile_code(const std::string& code, const std::string& lang,
 bool judge_code(const std::string& code, const std::string& language,
                 const std::string& judge_main,
                 int time_ms, int mem_mb, int output_mb,
-                JudgeOutcome* outcome, std::string* err) {
+                JudgeOutcome* outcome, std::string* err,
+                const std::function<void()>& heartbeat) {
     // ① 编译
     std::string bin, compiler_stderr;
     if (!compile_code(code, language, &bin, &compiler_stderr, outcome, err)) {
@@ -318,7 +337,9 @@ bool judge_code(const std::string& code, const std::string& language,
     int status = 0;
     // 运行超时 = 判题限额 + 5s 余量（进程启动/收尾不计入用户墙钟）
     // capture_stderr=false：JSON 只从 stdout 读，judge_main 自身 stderr 直接上日志
-    const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err);
+    // heartbeat 传给 run_capture：judge_main 运行期间每 30s 续命一次（D3）
+    const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err,
+                               heartbeat);
 
     unlink(bin.c_str());  // 谁创建谁清理：运行完删 bin
 

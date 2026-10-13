@@ -159,13 +159,25 @@ bool Db::finish(int64_t submission_id, JudgeStatus status,
     }
     MYSQL* c = static_cast<MYSQL*>(conn_);
 
-    // 状态机不变量（台阶 3 会做完整转移表，这里先守住最关键的一条）：
-    // finish 只写终态。若传入 pending/judging，说明调用方把"中间态"当结果写，
-    // 会让提交永远停在非终态、前端轮询超时——直接拒绝，不吞。
-    if (status == JudgeStatus::Pending || status == JudgeStatus::Judging) {
-        if (err) *err = "finish 拒绝写非终态: " +
-                        std::string(judge_status_to_string(status));
-        return false;
+    // 状态机不变量：finish 只写"判题产生的终态"。
+    // ★ N2：用白名单而非黑名单。黑名单（拒 Pending/Judging）在枚举新增状态时
+    //   会漏——Dead 补进枚举后不在拦截名单里，finish(id, Dead) 会被接受并命中
+    //   WHERE status='judging' 把判题中的任务静默标成死信。白名单默认拒绝一切
+    //   未知状态（fail-closed），枚举未来再新增也只会在 rescue 侧处理，不会
+    //   从判题结果这条路写进来。
+    switch (status) {
+        case JudgeStatus::Accepted:
+        case JudgeStatus::WrongAnswer:
+        case JudgeStatus::TimeLimit:
+        case JudgeStatus::MemoryLimit:
+        case JudgeStatus::RuntimeError:
+        case JudgeStatus::CompileError:
+        case JudgeStatus::SystemError:
+            break;  // 判题终态，放行
+        default:
+            if (err) *err = "finish 拒绝写非判题终态: " +
+                            std::string(judge_status_to_string(status));
+            return false;
     }
 
     const std::string st = judge_status_to_string(status);  // 来自固定 switch，可信
