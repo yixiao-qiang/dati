@@ -105,6 +105,7 @@ int main() {
     function showResult(data) {
       const lines = [
         `结果：${STATUS_TEXT[data.status] || data.status}`,
+        `通过用例：${data.passed_cases ?? 0}/${data.total_cases ?? 0}`,
         '--- stdout ---',
         data.stdout || '（空）',
         '--- stderr ---',

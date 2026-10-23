@@ -155,6 +155,7 @@ bool Db::claim(int64_t submission_id, std::string* err, bool* claimed) {
 
 bool Db::finish(int64_t submission_id, JudgeStatus status,
                 const std::string& stdout_text, const std::string& stderr_text,
+                int passed_cases, int total_cases,
                 std::string* err) {
     if (!conn_) {
         if (err) *err = "未连接 MySQL";
@@ -195,7 +196,9 @@ bool Db::finish(int64_t submission_id, JudgeStatus status,
     sql += st;
     sql += "', result='";
     sql += st;
-    sql += "', stdout='";
+    sql += "', passed_cases=" + std::to_string(passed_cases);
+    sql += ", total_cases=" + std::to_string(total_cases);
+    sql += ", stdout='";
     sql += out_e;
     sql += "', stderr='";
     sql += err_e;
@@ -220,8 +223,10 @@ bool Db::finish(int64_t submission_id, JudgeStatus status,
     return true;
 }
 
-bool Db::fetch_code(int64_t submission_id, std::string* code, std::string* language,
-                    std::string* err, bool* found) {
+
+bool Db::fetch_code(int64_t submission_id, std::string *code, std::string *language,
+                    std::string *err, bool *found)
+{
     *found = false;
     if (!conn_) {
         if (err) *err = "未连接 MySQL";

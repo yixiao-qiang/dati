@@ -68,7 +68,7 @@ public:
     // 判题完成：写入终态与结果（stdout/stderr 截断存储，避免单行超长）
     bool finish(int64_t submission_id, JudgeStatus status,
                 const std::string& stdout_text, const std::string& stderr_text,
-                std::string* err);
+                int passed_cases, int total_cases,std::string* err);
 
     // 读回一条提交的代码与语言（worker 判题前取源码用）
     // found 出参区分两种失败，语义不同不能混：

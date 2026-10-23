@@ -145,6 +145,8 @@ FULL_ROW = {
     "result": "accepted",
     "stdout": "hi\n",
     "stderr": "",
+    "passed_cases": 3,
+    "total_cases": 3,
     "created_at": None,
 }
 
@@ -161,6 +163,7 @@ def test_get_submission_returns_200_with_full_fields(client, monkeypatch):
     assert body["result"] == "accepted"
     assert body["stdout"] == "hi\n"
     assert body["stderr"] == ""
+    assert body["passed_cases"] == 3 and body["total_cases"] == 3
     assert "language" in body and "created_at" in body
 
 
