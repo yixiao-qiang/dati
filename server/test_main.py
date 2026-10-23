@@ -13,6 +13,13 @@ from fastapi.testclient import TestClient
 import main
 from main import MAX_CODE_BYTES, SubmitRequest, create_submission
 
+# K6 契约测试用：DB 状态机的全部终态（权威来源 = worker/src/db.cpp finish()
+# 白名单 + rescue 的 dead；前端 TERMINAL/STATUS_TEXT 必须与它对齐）
+DB_TERMINAL_STATUSES = {
+    "accepted", "wrong_answer", "tle", "mle",
+    "runtime_error", "compile_error", "system_error", "dead",
+}
+
 
 class FakeCursor:
     """记录 execute 的 SQL，可在 outbox INSERT 时注入失败（模拟第二条写崩）。"""
@@ -268,3 +275,56 @@ def test_add_testcases_404_when_problem_missing(client, monkeypatch):
 def test_add_testcases_400_empty_list(client):
     resp = client.post("/api/problems/1/testcases", json={"testcases": []})
     assert resp.status_code == 400, "空用例数组没有业务意义，400 拒绝"
+
+
+# ================= Wave 4 收尾 · K6 词汇表契约测试 =================
+
+def test_frontend_terminal_set_covers_all_db_terminal_statuses():
+    """前端 TERMINAL 集合必须 ⊇ DB 状态机全部终态（K6 契约）。
+
+    起因（Wave 4 收尾 P0）：前端曾用短码 wa/re/ce/se，而 API 返回全名
+    wrong_answer/...——4 个终态永远匹配不上 → 轮询永不停止。状态词汇表
+    横跨四层手工同步（DB 枚举 → judge_status_to_string → API JSON →
+    前端 TERMINAL），本测试把"前端文件内容"与"DB 终态集合"锁在一起，
+    任何一层漂移（含前端改回短码、新增状态忘同步）立刻红。
+    """
+    import re
+    from pathlib import Path
+
+    index_html = (Path(__file__).parent / "static" / "index.html").read_text(
+        encoding="utf-8")
+
+    m = re.search(r"const TERMINAL = new Set\(\[(.*?)\]\)", index_html, re.S)
+    assert m, "index.html 里找不到 TERMINAL 集合（被改名/重构？同步本测试）"
+    frontend_terminal = {
+        s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()
+    }
+
+    missing = DB_TERMINAL_STATUSES - frontend_terminal
+    assert not missing, (
+        f"前端 TERMINAL 缺少终态 {sorted(missing)}——这些状态会无限轮询。"
+        "词汇表以 worker/src/db.cpp finish() 白名单为准，四层必须同步。"
+    )
+
+
+def test_frontend_status_text_covers_all_statuses():
+    """STATUS_TEXT 必须覆盖全部状态（终态 + pending/judging），否则渲染 undefined。
+
+    与 TERMINAL 同源的词汇表漂移风险：STATUS_TEXT 缺键时前端显示
+    undefined，用户看不出是哪种终态——同一类契约，一并锁死。
+    """
+    import re
+    from pathlib import Path
+
+    index_html = (Path(__file__).parent / "static" / "index.html").read_text(
+        encoding="utf-8")
+
+    m = re.search(r"const STATUS_TEXT = \{(.*?)\};", index_html, re.S)
+    assert m, "index.html 里找不到 STATUS_TEXT 映射（被改名/重构？同步本测试）"
+    status_text_keys = set(re.findall(r"'([a-z_]+)'\s*:", m.group(1)))
+
+    all_statuses = DB_TERMINAL_STATUSES | {"pending", "judging"}
+    missing = all_statuses - status_text_keys
+    assert not missing, (
+        f"前端 STATUS_TEXT 缺少状态 {sorted(missing)}——这些状态会渲染成 undefined。"
+    )

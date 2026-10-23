@@ -20,6 +20,7 @@
 
 #include "../src/internal.h"
 #include "../src/db.h"
+#include "../src/judge.h"
 
 namespace {
 
@@ -151,6 +152,20 @@ void test_output_matches() {
     CHECK(worker::output_matches("\n", ""));
 }
 
+void test_judge_outcome_default() {
+    // K7 契约：JudgeOutcome 默认构造必须是 SystemError（fail-closed）。
+    // 起因：status 原是未初始化枚举——judge_code 内部故障提前 return 时
+    // 留下垃圾值，传给 db.finish() 被白名单拒绝 → finish 失败 → 不 ACK
+    // → 消息无限重投。judge.h 已加默认成员初始化，此断言锁住它不被回退。
+    // 注意配套约束：编译成功路径必须显式重置 status（见 judge.cpp 的
+    // Pending 重置）——默认 SystemError 与"中性中间态"是成对设计。
+    worker::JudgeOutcome out;
+    CHECK(out.status == worker::JudgeStatus::SystemError);
+    // 附带契约：计数字段默认 0（台阶 2/3 的落库字段）
+    CHECK(out.passed_cases == 0);
+    CHECK(out.total_cases == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -159,6 +174,7 @@ int main() {
     test_parse_status();
     test_judge_status_to_string();
     test_output_matches();
+    test_judge_outcome_default();
 
     if (g_failures == 0) {
         std::printf("\nworker_tests: 全部通过 ✅（%d 断言，0 失败）\n", 0);
