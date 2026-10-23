@@ -39,16 +39,24 @@ int main() {
 
   <script>
     // 轮询终止条件：status 进入这些状态即停止（面试点：dead 也是终态！）
+    // ★ 词汇表必须与 DB 一致（judge_status_to_string 输出全名）：
+    //   wrong_answer / runtime_error / compile_error / system_error——用短码
+    //   wa/re/ce/se 会漏判 4 个终态 → 轮询永不停止（Wave 3 P0 教训）
     const TERMINAL = new Set([
-      'accepted', 'wa', 'tle', 'mle', 're', 'ce', 'se', 'dead',
+      'accepted', 'wrong_answer', 'tle', 'mle',
+      'runtime_error', 'compile_error', 'system_error', 'dead',
     ]);
     // 状态机英文 → 中文可读（与 worker 状态机词汇表一致）
     const STATUS_TEXT = {
       'pending': '排队中', 'judging': '判题中',
-      'accepted': '通过（AC）', 'wa': '答案错误（WA）', 'tle': '超时（TLE）',
-      'mle': '内存超限（MLE）', 're': '运行时错误（RE）', 'ce': '编译错误（CE）',
-      'se': '系统错误（SE）', 'dead': '判死（系统故障，请重试）',
+      'accepted': '通过（AC）', 'wrong_answer': '答案错误（WA）', 'tle': '超时（TLE）',
+      'mle': '内存超限（MLE）', 'runtime_error': '运行时错误（RE）',
+      'compile_error': '编译错误（CE）', 'system_error': '系统错误（SE）',
+      'dead': '判死（系统故障，请重试）',
     };
+    // 轮询兜底：60 次（2s 间隔 ≈ 2 分钟）后强制停止——防止未来新增状态
+    // 未同步进 TERMINAL 时再次出现无限轮询（fail-closed）
+    const MAX_POLL_TRIES = 60;
 
     const form = document.getElementById('form');
     const btn = document.getElementById('btn');
@@ -78,7 +86,15 @@ int main() {
     });
 
     function poll(sid) {
+      let tries = 0;
       const timer = setInterval(async () => {
+        if (++tries > MAX_POLL_TRIES) {
+          // 兜底：超上限强制停（见 MAX_POLL_TRIES 注释）
+          clearInterval(timer);
+          result.textContent = `#${sid} 轮询超时（2 分钟），请刷新重试`;
+          btn.disabled = false;
+          return;
+        }
         try {
           const resp = await fetch('/api/submission/' + sid);
           if (resp.status === 404) {

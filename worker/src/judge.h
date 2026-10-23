@@ -21,8 +21,11 @@ namespace worker {
 
 // 判题结果（与 judge_main 输出的 JSON 字段对应）
 struct JudgeOutcome {
-    worker::JudgeStatus status;  // 枚举：与 db.finish 的类型对齐
-                                 // （judge.cpp 解析 JSON 时做 "OK"→Accepted 映射）
+    // ★ fail-closed 默认：任何未走完判题流水线的路径（内部故障提前 return）
+    //   都留下"系统错误"而不是未初始化的垃圾枚举值——垃圾值传给 db.finish()
+    //   会被白名单拒绝 → finish 失败 → 不 ACK → 无限重投。默认 SystemError
+    //   保证即使逻辑漏了一条路径，落库也是明确可诊断的状态。
+    worker::JudgeStatus status = worker::JudgeStatus::SystemError;
     int exit_code = -1;
     int signal = 0;
     int64_t cpu_us = 0;

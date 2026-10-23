@@ -281,6 +281,11 @@ bool compile_code(const std::string& code, const std::string& lang,
 
     // ④ 编译成功：src 删掉，bin 保留给运行阶段
     unlink(src.c_str());
+    // ★ 显式重置 status：JudgeOutcome 默认 SystemError（fail-closed），编译成功
+    //   若不重置，judge_code 的 `if (status==SystemError) return true`（编译故障
+    //   判断）会把"编译成功"误判成编译超时 → 所有提交一律 system_error。
+    //   编译成功 = 尚未判题，取中性值 Pending，后续逐用例循环会覆盖它。
+    outcome->status = JudgeStatus::Pending;
     *out_bin = bin;
     return true;
 }

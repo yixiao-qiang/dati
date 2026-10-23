@@ -102,6 +102,9 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     if (!has_cases || testcases.empty()) {
         // fail-closed：题目无用例 = 无法判题（不是用户的错，也不该猜 AC）。
         // 报 SystemError 并 ACK（终态已写，消息无需重投）。
+        // ★ found 语义：能走到这里说明提交必存在（fetch_code 已过滤脏消息），
+        //   !has_cases 只可能是"题目没有用例"（配置问题）——提交不存在被
+        //   fetch_code 拦在前面，不会把脏消息写成 SystemError。
         worker::JudgeOutcome sys;
         sys.status = worker::JudgeStatus::SystemError;
         sys.error_msg = "题目没有测试用例";
