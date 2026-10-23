@@ -69,3 +69,13 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_undelivered (delivered, id)       -- 投递器扫描：WHERE delivered=0 ORDER BY id
 ) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS testcase(
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    problem_id BIGINT NOT NULL,
+    input MEDIUMTEXT NOT NULL,
+    expected_output MEDIUMTEXT NOT NULL,
+    ordinal INT NOT NULL DEFAULT 0,
+    score INT NOT NULL DEFAULT 1,
+    KEY idx_problem (problem_id,ordinal)
+) ENGINE=InnoDB;

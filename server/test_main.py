@@ -194,3 +194,74 @@ def test_get_submission_500_when_db_unavailable(client, monkeypatch):
 def test_get_submission_rejects_non_numeric_id(client):
     resp = client.get("/api/submission/abc")
     assert resp.status_code == 422, "sid 声明为 int，pydantic 自动拒绝非数字（免费的类型校验）"
+
+
+# ---------- Wave 4 台阶 1：题目管理 API ----------
+
+def test_create_problem_endpoint_201(client, monkeypatch):
+    monkeypatch.setattr(main, "create_problem", lambda *a: 7)
+    resp = client.post("/api/problems", json={"title": "A+B"})
+    assert resp.status_code == 201
+    assert resp.json() == {"problem_id": 7}
+
+
+def test_create_problem_endpoint_400_invalid_title(client):
+    resp = client.post("/api/problems", json={"title": "   "})
+    assert resp.status_code == 400, "空标题是参数错，400 而非 201"
+
+
+def test_create_problem_endpoint_400_invalid_limits(client):
+    resp = client.post("/api/problems", json={"title": "A", "time_limit_ms": 99999})
+    assert resp.status_code == 400
+    assert "time_limit_ms" in resp.json()["detail"], "错误信息要指出哪个字段越界"
+
+
+def test_list_problems_endpoint_200(client, monkeypatch):
+    monkeypatch.setattr(main, "list_problems",
+                        lambda: [{"id": 1, "title": "A+B", "time_limit_ms": 1000,
+                                  "mem_limit_mb": 256, "output_limit_mb": 64}])
+    resp = client.get("/api/problems")
+    assert resp.status_code == 200
+    assert resp.json()[0]["title"] == "A+B"
+
+
+def test_problem_detail_200_with_testcases(client, monkeypatch):
+    detail = {
+        "id": 1, "title": "A+B", "time_limit_ms": 1000,
+        "mem_limit_mb": 256, "output_limit_mb": 64,
+        "testcases": [{"id": 1, "ordinal": 0, "input": "1 2",
+                       "expected_output": "3", "score": 1}],
+    }
+    monkeypatch.setattr(main, "get_problem_with_testcases", lambda pid: detail)
+    resp = client.get("/api/problems/1")
+    assert resp.status_code == 200
+    assert len(resp.json()["testcases"]) == 1, "详情必须带用例（判题逐用例跑的输入来源）"
+
+
+def test_problem_detail_404_when_not_exists(client, monkeypatch):
+    monkeypatch.setattr(main, "get_problem_with_testcases", lambda pid: None)
+    resp = client.get("/api/problems/999")
+    assert resp.status_code == 404
+
+
+def test_add_testcases_201(client, monkeypatch):
+    monkeypatch.setattr(main, "add_testcases", lambda pid, tcs: 2)
+    resp = client.post(
+        "/api/problems/1/testcases",
+        json={"testcases": [{"input": "1 2", "expected_output": "3"},
+                            {"input": "2 3", "expected_output": "5"}]},
+    )
+    assert resp.status_code == 201
+    assert resp.json() == {"problem_id": 1, "count": 2}, "count = 插入条数"
+
+
+def test_add_testcases_404_when_problem_missing(client, monkeypatch):
+    monkeypatch.setattr(main, "add_testcases", lambda pid, tcs: None)
+    resp = client.post("/api/problems/999/testcases",
+                       json={"testcases": [{"input": "1", "expected_output": "1"}]})
+    assert resp.status_code == 404, "题目不存在挂用例必须 404——防止孤儿用例静默写入"
+
+
+def test_add_testcases_400_empty_list(client):
+    resp = client.post("/api/problems/1/testcases", json={"testcases": []})
+    assert resp.status_code == 400, "空用例数组没有业务意义，400 拒绝"

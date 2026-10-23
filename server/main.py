@@ -41,6 +41,19 @@ class SubmitRequest(BaseModel):
     language: str = "cpp"
     problem_id: int = 1  # 关联题目（限额从 problem 表读；学习期默认题 1）
 
+class CreateProblemRequest(BaseModel):
+    title: str
+    time_limit_ms: int = 1000
+    mem_limit_mb: int = 256
+    output_limit_mb: int = 64
+
+class TestcaseItem(BaseModel):
+    input: str = ""
+    expected_output: str = ""
+    score: int = 1
+
+class AddTestcasesRequest(BaseModel):
+    testcases: list[TestcaseItem]
 
 def create_submission(code: str, language: str, problem_id: int = 1) -> int:
     """一个事务写 submission + outbox，返回 submission_id。
@@ -104,6 +117,93 @@ def get_submission(sid: int) -> dict | None:
     return row
 
 
+def create_problem(title, time_limit_ms, mem_limit_mb, output_limit_mb) -> int:
+    """创建题目：INSERT problem → 返回新 id。"""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO problem (title, time_limit_ms, mem_limit_mb, output_limit_mb) "
+                "VALUES (%s, %s, %s, %s)",
+                (title, time_limit_ms, mem_limit_mb, output_limit_mb),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def list_problems() -> list:
+    """列出所有题目（不含用例，列表页用）。"""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, time_limit_ms, mem_limit_mb, output_limit_mb "
+                "FROM problem"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return rows
+
+def get_problem_with_testcases(pid) -> dict | None:
+    """根据题目 ID 查询题目及所有测试用例。
+
+    None = 题目不存在（HTTP 层据此 404）。
+    """
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, time_limit_ms, mem_limit_mb, output_limit_mb "
+                "FROM problem WHERE id=%s",
+                (pid,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            # 用例按业务序（ordinal）排：判题逐用例跑，顺序就是执行顺序
+            cur.execute(
+                "SELECT id, ordinal, input, expected_output, score "
+                "FROM testcase WHERE problem_id=%s ORDER BY ordinal",
+                (pid,),
+            )
+            row["testcases"] = cur.fetchall()
+    finally:
+        conn.close()
+    return row
+
+def add_testcases(pid, testcases) -> int | None:
+    """给题目挂载测试用例。
+
+    None = 题目不存在（HTTP 层据此 404）；否则返回插入条数。
+    """
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            # ① 存在性检查：不查就 INSERT → 孤儿用例（表无外键约束时静默产生）
+            cur.execute("SELECT id FROM problem WHERE id=%s", (pid,))
+            if cur.fetchone() is None:
+                return None
+            # ② executemany 一次往返批量插入（N 次 execute = N 次网络往返）
+            #    ordinal = 数组下标（业务顺序 = 数组顺序，与详情接口排序一致）
+            cur.executemany(
+                "INSERT INTO testcase (problem_id, input, expected_output, ordinal, score) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                [(pid, tc.input, tc.expected_output, i, tc.score)
+                 for i, tc in enumerate(testcases)],
+            )
+        conn.commit()
+        return len(testcases)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 @app.get("/api/submission/{sid}")
 def submission_status(sid: int):
     try:
@@ -124,6 +224,53 @@ def submission_status(sid: int):
         "stderr": row["stderr"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
     }
+
+@app.post("/api/problems", status_code=201)
+def create_problem_endpoint(req: CreateProblemRequest):
+    # 业务校验（pydantic 只保证类型，范围要手动）：参数错是用户的错（400）
+    if not req.title.strip():
+        raise HTTPException(status_code=400, detail="标题不能为空")
+    if not (1 <= req.time_limit_ms <= 60000):
+        raise HTTPException(status_code=400, detail="time_limit_ms 需在 1-60000 之间")
+    if not (16 <= req.mem_limit_mb <= 1024):
+        raise HTTPException(status_code=400, detail="mem_limit_mb 需在 16-1024 之间")
+    if not (1 <= req.output_limit_mb <= 256):
+        raise HTTPException(status_code=400, detail="output_limit_mb 需在 1-256 之间")
+
+    try:
+        pid = create_problem(req.title, req.time_limit_ms, req.mem_limit_mb, req.output_limit_mb)
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+    return {"problem_id": pid}
+
+@app.get("/api/problems")
+def list_problems_endpoint():
+    try:
+        return list_problems()
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+
+@app.get("/api/problems/{problem_id}")
+def problem_detail(problem_id: int):
+    try:
+        row = get_problem_with_testcases(problem_id)
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"题目不存在: {problem_id}")
+    return row
+
+@app.post("/api/problems/{problem_id}/testcases", status_code=201)
+def add_testcases_endpoint(problem_id: int, req: AddTestcasesRequest):
+    if not req.testcases:
+        raise HTTPException(status_code=400, detail="用例列表不能为空")
+    try:
+        n = add_testcases(problem_id, req.testcases)
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+    if n is None:
+        raise HTTPException(status_code=404, detail=f"题目不存在: {problem_id}")
+    return {"problem_id": problem_id, "count": n}
 
 
 # 静态页面（先丑后美，Wave 4 换 Vue3）
