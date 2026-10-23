@@ -1,37 +1,44 @@
-# OJ 判题 server（垂直切片）
+# OJ 判题 server（Wave 3 · 异步判题）
 
-判题全链路：浏览器提交代码 → 本 server → g++ 编译 → judge_main（C++ 沙箱）→ JSON 返回。
+链路：浏览器提交代码 → `POST /api/submit` → 一个事务写 `submission` + `outbox` → 返回 `submission_id`。
+判题由 worker 侧投递器扫 outbox → XADD 入 Redis → worker 判题 → 写回 DB（Wave 2 全套机制，本 server 不再判题）。
 
 ## 快速开始（三行）
 
 ```bash
-# 1. 装依赖
-pip install -r server/requirements.txt
+# 1. 装依赖（Python 3.10+）
+python3 -m pip install -r server/requirements.txt
 
-# 2. 构建沙箱（产出 judge_main，本机需 Ubuntu + root 权限）
-sudo bash sandbox/tests/smoke/run_all.sh 10
+# 2. 建表（worker/init.sql：oj 库 + submission + outbox + oj 账号）
+sudo mysql < worker/init.sql
 
-# 3. 启动（JUDGE_MAIN 指向构建产物）
-JUDGE_MAIN=$PWD/sandbox/tests/smoke/build/judge_main \
-  sudo python3 -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+# 3. 启动（无需 JUDGE_MAIN——判题已移到 worker）
+sudo python3 -m uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
 
-## 为什么必须配 JUDGE_MAIN
+> 本机若同时有多个 Python，务必用 `python3 -m pip` 而不是裸 `pip`，避免装到别的解释器。
 
-judge_main 是 C++ 沙箱的 CLI 判题入口（clone/cgroup/pivot_root，需要 root）。
-server 不写死它的路径——克隆仓库的人环境不同，启动时未配置会直接拒绝启动。
+## 接口
 
-## 测试
+| 接口 | 方法 | 入参 | 返回 | 错误 |
+|---|---|---|---|---|
+| `/api/submit` | POST | `{code, language}` | `201 {"submission_id": N}` | 400 参数错（>64KB / 语言不在白名单）、500 DB 不可用 |
+
+`submission_id` 是查询凭据：前端拿它轮询 `/api/submission/{id}`（台阶 2 实现）。
+
+## 测试（本机可跑，无需 MySQL——pymysql 被 mock）
 
 ```bash
-# 沙箱冒烟（12 测试 64 断言）
-sudo bash sandbox/tests/smoke/run_all.sh
-
-# API 冒烟（VM 无 curl 时用 Python urllib，见仓库学习笔记/垂直切片_对接文档.md）
+python3 -m pip install -r server/requirements-dev.txt
+cd server && python3 -m pytest test_main.py -v
 ```
+
+覆盖：事务边界（两条 INSERT 同事务、异常回滚）、接口校验（400/500）、返回契约（201 + submission_id）。
 
 ## 架构决策速记（面试）
 
-- 编译在沙箱外：编译器依赖大量 syscall/头文件，运行用户二进制才是风险面
-- 子进程调 judge_main 而非 link 库：权限/崩溃隔离、语言解耦
-- 参数校验前置：pydantic 管格式，业务代码管语义
+- 语言按层选型：沙箱/worker 用 C++（系统调用、资源计量），server 用 Python（纯 IO 编排）
+- 提交接口不碰 Redis：outbox 解耦登记与投递，Redis 挂了不阻塞提交（本地事务 + 最终一致）
+- 同事务写 submission+outbox：拆开会导致"登记了但永不投递"的无声丢失
+- `autocommit=False`：PyMySQL 默认每条语句自动提交，必须关掉才能控制事务边界
+- 错误分类：参数错 = 用户的错（400）；DB 错 = 环境的错（500，前端提示重试）
