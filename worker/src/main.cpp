@@ -92,8 +92,26 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
                      (long long)m.submission_id, err.c_str());
         return;  // DB 错误：不 ACK 留 PEL 等重投（沿用不吞错纪律）
     }
-    std::fprintf(stderr, "[judge] id=%lld 限额 time=%dms mem=%dMB output=%dMB\n",
-                 (long long)m.submission_id, time_ms, mem_mb, output_mb);
+    std::vector<worker::Testcase> testcases;
+    bool has_cases = false;
+    if (!db.fetch_testcases(m.submission_id, &testcases, &err, &has_cases)) {
+        std::fprintf(stderr, "fetch_testcases 失败(id=%lld): %s\n",
+                     (long long)m.submission_id, err.c_str());
+        return;  // DB 错误：不 ACK 留 PEL 等重投
+    }
+    if (!has_cases || testcases.empty()) {
+        // fail-closed：题目无用例 = 无法判题（不是用户的错，也不该猜 AC）。
+        // 报 SystemError 并 ACK（终态已写，消息无需重投）。
+        worker::JudgeOutcome sys;
+        sys.status = worker::JudgeStatus::SystemError;
+        sys.error_msg = "题目没有测试用例";
+        db.finish(m.submission_id, sys.status, sys.stdout_text, sys.stderr_text, &err);
+        q.ack(m.id, nullptr);
+        return;
+    }
+    std::fprintf(stderr, "[judge] id=%lld 限额 time=%dms mem=%dMB output=%dMB 用例数=%zu\n",
+                 (long long)m.submission_id, time_ms, mem_mb, output_mb,
+                 testcases.size());
     // ★ D3：判题循环内周期心跳——judge_code 阻塞期间 run_capture 每 30s 调
     //   一次回调 reset_idle，防止长任务（未来大工程编译/判题机负载高）消息
     //   idle 涨过 10min 判死阈值被误判死。主循环此刻被阻塞，只有回调能续命。
@@ -101,7 +119,8 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     //   若 Redis 连接已断，静默失败会让心跳在最需要它的时候失效且无迹可查
     //   （违背"不吞错"纪律）。30s 一次，打日志不会刷屏。
     std::string hb_err;
-    if (!judge_code(code, lang, judge_main, time_ms, mem_mb, output_mb, &out, &err,
+    if (!judge_code(code, lang, judge_main, time_ms, mem_mb, output_mb, testcases,
+                    &out, &err,
                     [&] {
                         hb_err.clear();
                         if (!q.reset_idle(consumer_id, m.id, &hb_err)) {

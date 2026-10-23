@@ -32,8 +32,8 @@ static std::string json_escape(const std::string& s) {
 
 int main(int argc, char* argv[]) {
     // 参数：argv[1]=二进制路径 argv[2]=时间ms argv[3]=内存MB argv[4]=输出MB
-    if (argc != 5) {
-        std::fprintf(stderr, "用法: %s <binary> <time_ms> <mem_mb> <output_mb>\n", argv[0]);
+    if (argc != 6) {
+        std::fprintf(stderr, "用法: %s <binary> <time_ms> <mem_mb> <output_mb> <input>\n", argv[0]);
         return 1;
     }
 
@@ -42,7 +42,7 @@ int main(int argc, char* argv[]) {
     cfg.time_limit_ms = std::atoi(argv[2]);
     cfg.memory_limit_mb = std::atoi(argv[3]);
     cfg.output_limit_mb = std::atoi(argv[4]);
-    cfg.input = "";
+    cfg.input = argv[5];
     cfg.pids_limit = 64;
     cfg.use_rootfs = true;
 

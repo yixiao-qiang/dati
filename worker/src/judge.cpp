@@ -301,13 +301,25 @@ JudgeStatus parse_status(const std::string& s) {
     return JudgeStatus::SystemError;
 }
 
-// ================= 主函数：编译 + 运行 + 解析 =================
+bool output_matches(const std::string &expected, const std::string &actual)
+{
+   auto rtrim = [](std::string s){
+        while(!s.empty() && (s.back() == ' '|| s.back() == '\n'|| s.back() == '\r'||s.back() == '\t')) s.pop_back();
+        return s;
+   };
+   return rtrim(expected) == rtrim(actual);
+}
+
+// ================= 主函数：编译一次 + 逐用例运行 + 比对 =================
 bool judge_code(const std::string& code, const std::string& language,
                 const std::string& judge_main,
                 int time_ms, int mem_mb, int output_mb,
+                const std::vector<Testcase>& testcases,
                 JudgeOutcome* outcome, std::string* err,
                 const std::function<void()>& heartbeat) {
-    // ① 编译
+    outcome->total_cases = static_cast<int>(testcases.size());
+    outcome->passed_cases = 0;
+    // ① 编译（沙箱外 g++，一次）——产物与用例无关，N 个用例共用同一份 bin
     std::string bin, compiler_stderr;
     if (!compile_code(code, language, &bin, &compiler_stderr, outcome, err)) {
         return false;  // 内部故障
@@ -320,54 +332,78 @@ bool judge_code(const std::string& code, const std::string& language,
         return true;   // 编译超时
     }
 
-    // ② 运行 judge_main（沙箱内）
-    //    judge_main 需要 root：worker 不持 root（权限隔离），非 root 时 sudo -n 前缀
-    //    -n = non-interactive，不弹密码（worker 无交互，弹密码会挂死）
-    std::vector<std::string> argv;
-    if (geteuid() != 0) {
-        argv = {"sudo", "-n", judge_main, bin,
-                std::to_string(time_ms), std::to_string(mem_mb),
-                std::to_string(output_mb)};
-    } else {
-        argv = {judge_main, bin,
-                std::to_string(time_ms), std::to_string(mem_mb),
-                std::to_string(output_mb)};
+    // ② 逐用例运行 judge_main（沙箱内，每个用例独立沙箱 = 独立隔离 + 独立计量）
+    //    短路：第一个非 AC 即停（全过才 AC，结果已定后续白跑）；bin 循环结束才删
+    for (const auto& tc : testcases) {
+        // judge_main 需要 root：worker 不持 root（权限隔离），非 root 时 sudo -n 前缀
+        // -n = non-interactive，不弹密码（worker 无交互，弹密码会挂死）
+        std::vector<std::string> argv;
+        if (geteuid() != 0) {
+            argv = {"sudo", "-n", judge_main, bin,
+                    std::to_string(time_ms), std::to_string(mem_mb),
+                    std::to_string(output_mb), tc.input};
+        } else {
+            argv = {judge_main, bin,
+                    std::to_string(time_ms), std::to_string(mem_mb),
+                    std::to_string(output_mb), tc.input};
+        }
+
+        std::string json;
+        int status = 0;
+        // 运行超时 = 判题限额 + 5s 余量（进程启动/收尾不计入用户墙钟）
+        // capture_stderr=false：JSON 只从 stdout 读，judge_main 自身 stderr 直接上日志
+        // heartbeat 每个用例都传：循环里多个 run_capture，每个都要续命（D3）
+        const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err,
+                                   heartbeat);
+
+        if (rc == -1) {   // fork/pipe 故障（内部错误）
+            unlink(bin.c_str());
+            return false;
+        }
+        if (rc == 1) {    // judge_main 自身超时（兜底）
+            unlink(bin.c_str());
+            outcome->status = JudgeStatus::SystemError;
+            outcome->error_msg = "judge_main 运行超时";
+            return true;
+        }
+
+        // 解析 JSON（学习期子串查找；生产级 nlohmann/json）
+        if (json.find("\"status\"") == std::string::npos) {
+            unlink(bin.c_str());
+            outcome->status = JudgeStatus::SystemError;
+            outcome->error_msg = "judge_main 输出缺少 status: " + json;
+            return true;
+        }
+
+        const JudgeStatus st = parse_status(json_str(json, "status"));
+        outcome->exit_code  = std::atoi(json_num(json, "exit_code").c_str());
+        outcome->signal     = std::atoi(json_num(json, "signal").c_str());
+        outcome->cpu_us     = std::atoll(json_num(json, "cpu_us").c_str());
+        outcome->mem_bytes  = std::atoll(json_num(json, "mem_bytes").c_str());
+        outcome->wall_us    = std::atoll(json_num(json, "wall_us").c_str());
+        outcome->stdout_text = unescape(json_str(json, "stdout"));
+        outcome->stderr_text = unescape(json_str(json, "stderr"));
+        outcome->error_msg  = unescape(json_str(json, "error_msg"));
+
+        // ★ 判定（台阶 2 核心）：OK 只证明"程序跑完没崩"，对错靠输出比对
+        if (st == JudgeStatus::Accepted &&
+            output_matches(outcome->stdout_text, tc.expected_output)) {
+            outcome->passed_cases++;   // 该用例过，继续下一用例
+        } else if (st == JudgeStatus::Accepted) {
+            outcome->status = JudgeStatus::WrongAnswer;  // 输出不对 → WA，短路
+            break;
+        } else {
+            outcome->status = st;                        // TLE/MLE/RE → 短路
+            break;
+        }
     }
 
-    std::string json;
-    int status = 0;
-    // 运行超时 = 判题限额 + 5s 余量（进程启动/收尾不计入用户墙钟）
-    // capture_stderr=false：JSON 只从 stdout 读，judge_main 自身 stderr 直接上日志
-    // heartbeat 传给 run_capture：judge_main 运行期间每 30s 续命一次（D3）
-    const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err,
-                               heartbeat);
+    unlink(bin.c_str());  // 谁创建谁清理：所有用例跑完删 bin
 
-    unlink(bin.c_str());  // 谁创建谁清理：运行完删 bin
-
-    if (rc == -1) return false;   // fork/pipe 故障（内部错误）
-    if (rc == 1) {                // judge_main 自身超时（兜底）
-        outcome->status = JudgeStatus::SystemError;
-        outcome->error_msg = "judge_main 运行超时";
-        return true;
+    // ③ 全过（循环没 break）→ Accepted
+    if (outcome->passed_cases == outcome->total_cases) {
+        outcome->status = JudgeStatus::Accepted;
     }
-
-    // ③ 解析 JSON（学习期子串查找；生产级 nlohmann/json）
-    if (json.find("\"status\"") == std::string::npos) {
-        outcome->status = JudgeStatus::SystemError;
-        outcome->error_msg = "judge_main 输出缺少 status: " + json;
-        return true;
-    }
-
-    outcome->status     = parse_status(json_str(json, "status"));
-    outcome->exit_code  = std::atoi(json_num(json, "exit_code").c_str());
-    outcome->signal     = std::atoi(json_num(json, "signal").c_str());
-    outcome->cpu_us     = std::atoll(json_num(json, "cpu_us").c_str());
-    outcome->mem_bytes  = std::atoll(json_num(json, "mem_bytes").c_str());
-    outcome->wall_us    = std::atoll(json_num(json, "wall_us").c_str());
-    outcome->stdout_text = unescape(json_str(json, "stdout"));
-    outcome->stderr_text = unescape(json_str(json, "stderr"));
-    outcome->error_msg  = unescape(json_str(json, "error_msg"));
-
     return true;
 }
 

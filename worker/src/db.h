@@ -35,6 +35,16 @@ enum class JudgeStatus {
 
 const char* judge_status_to_string(JudgeStatus s);
 
+// 判题用例（Wave 4 台阶2：题目 1:N，经 submission.problem_id 关联）。
+// 放 namespace 顶层而非 Db class 内：judge.h 也要用它（worker::Testcase）。
+struct Testcase {
+    int64_t id;
+    int ordinal;                 // 题目内顺序（执行顺序）
+    std::string input;           // 写进沙箱 stdin
+    std::string expected_output; // 与程序 stdout 比对
+    int score;                   // 权重（部分分扩展点，当前全 1）
+};
+
 // MySQL 判题状态存储封装
 class Db {
 public:
@@ -76,6 +86,13 @@ public:
     bool fetch_limits(int64_t submission_id, int* time_ms, int* mem_mb, int* output_mb,
                       std::string* err, bool* found);
 
+    // 经 submission.problem_id 取用例（Wave 4 台阶2，一条 SQL JOIN）。
+    // 语义与 fetch_code/fetch_limits 对齐：
+    //   *found=false = 提交不存在 或 题目没有用例（两种都"无法判"）
+    //   返回 false   = DB 错误（不 ACK 留 PEL）
+    bool fetch_testcases(int64_t submission_id, std::vector<Testcase>* out,
+                         std::string* err, bool* found);
+    
     // rescue 扫描：找出 judging 超时（judge_started_at 早于 NOW()-stale_minutes）的任务
     //   - retry_count < max_retry → 重置 pending + retry_count+1（让消息重投后能再次 claim）
     //   - retry_count >= max_retry → 转 dead（死信，人工介入，不再自动捞）

@@ -132,6 +132,25 @@ void test_judge_status_to_string() {
     CHECK(worker::parse_status(worker::judge_status_to_string(JudgeStatus::Dead)) == JudgeStatus::SystemError);
 }
 
+void test_output_matches() {
+    // 精确相等
+    CHECK(worker::output_matches("hi\n", "hi\n"));
+    // 尾部换行不同（常见：程序 printf 自带 \n，期望串没有）
+    CHECK(worker::output_matches("hi\n", "hi"));
+    // 尾部空格
+    CHECK(worker::output_matches("hi ", "hi"));
+    // 尾部 \r\n
+    CHECK(worker::output_matches("hi\r\n", "hi"));
+    // 内容不同 → false
+    CHECK(!worker::output_matches("hi", "ho"));
+    // 多行：行内差异必须判 false
+    CHECK(!worker::output_matches("a\nb\n", "a\nc"));
+    // 空 vs 空
+    CHECK(worker::output_matches("", ""));
+    // 空 vs 纯空白：rtrim 后都是空 → 相等
+    CHECK(worker::output_matches("\n", ""));
+}
+
 }  // namespace
 
 int main() {
@@ -139,6 +158,7 @@ int main() {
     test_escape_sql();
     test_parse_status();
     test_judge_status_to_string();
+    test_output_matches();
 
     if (g_failures == 0) {
         std::printf("\nworker_tests: 全部通过 ✅（%d 断言，0 失败）\n", 0);

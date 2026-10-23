@@ -33,6 +33,15 @@ struct ChildArgs {
     int in_fd;         // stdin 读端
     int out_fd;        // stdout 写端
     int err_fd;        // stderr 写端
+    // ★ 子进程必须显式关闭的管道另一端（clone 会继承全部 fd）：
+    //   in_w_fd  = stdin 写端：不关 → 用户程序 execve 后仍持有写端 →
+    //              scanf/fgets 的 lookahead read 永远等不到 EOF → 卡死 TLE
+    //   out_r_fd / err_r_fd = stdout/stderr 读端：不关 → fd 泄漏给用户程序
+    //   sync_w_fd = 同步管道写端：父进程已关，子进程这份也要关
+    int in_w_fd;
+    int out_r_fd;
+    int err_r_fd;
+    int sync_w_fd;
     bool use_rootfs;
     // RLIMIT_CPU 兜底（秒），由父进程按 time_limit_ms 换算。
     // 先初始化为 0 避免未初始化成员，待任务 1.6 实现后启用。
@@ -60,10 +69,15 @@ static int child_func(void* arg) {
     dup2(args->out_fd, 1);
     dup2(args->err_fd, 2);
 
-    // 关闭不需要的 fd
+    // 关闭不需要的 fd：被重定向的原始 fd + 继承来的管道另一端。
+    // 顺序无影响；漏关 in_w_fd 是致命 bug（见 ChildArgs 注释）。
     close(args->in_fd);
     close(args->out_fd);
     close(args->err_fd);
+    close(args->in_w_fd);
+    close(args->out_r_fd);
+    close(args->err_r_fd);
+    close(args->sync_w_fd);
 
     // === 知识点3：pivot_root 切根 ===
     std::string exec_path = args->binary_path;
@@ -140,6 +154,10 @@ JudgeResult run(const SandboxConfig& config) {
     args.in_fd = in_pipe[0];
     args.out_fd = out_pipe[1];
     args.err_fd = err_pipe[1];
+    args.in_w_fd = in_pipe[1];      // 子进程继承的写端，child_func 关闭
+    args.out_r_fd = out_pipe[0];    // 子进程继承的读端，child_func 关闭
+    args.err_r_fd = err_pipe[0];    // 同上
+    args.sync_w_fd = sync_pipe[1];  // 子进程继承的写端，child_func 关闭
     args.use_rootfs = config.use_rootfs;
     int cpu_sec = config.time_limit_ms /1000 *2;
     if (cpu_sec < 5) cpu_sec = 5;

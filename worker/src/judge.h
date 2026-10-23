@@ -31,6 +31,8 @@ struct JudgeOutcome {
     std::string stdout_text;
     std::string stderr_text;
     std::string error_msg;   // INTERNAL_ERROR 时的人类可读原因
+    int passed_cases = 0;   // 台阶 2：通过的用例数（全过 = AC）
+    int total_cases = 0;    // 台阶 2：用例总数（台阶 3 落库展示用）
 };
 
 // 判题流水线：编译 + 运行，返回 outcome
@@ -47,6 +49,7 @@ struct JudgeOutcome {
 bool judge_code(const std::string& code, const std::string& language,
                 const std::string& judge_main,
                 int time_ms, int mem_mb, int output_mb,
+                const std::vector<Testcase>& testcases,
                 JudgeOutcome* outcome, std::string* err,
                 const std::function<void()>& heartbeat = {});
 

@@ -35,4 +35,5 @@ std::string escape_sql(void* conn, const std::string& raw);
 // 未知字符串 → SystemError（fail-closed：读不懂就当系统错误，不猜）。
 JudgeStatus parse_status(const std::string& s);
 
+bool output_matches(const std::string& expected, const std::string& actual);
 }  // namespace worker
