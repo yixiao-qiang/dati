@@ -476,4 +476,29 @@ bool Db::revert_reset(int64_t submission_id, std::string* err) {
     return true;
 }
 
+bool Db::cleanup_outbox(int64_t* deleted_rows, std::string* err) {
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // N4（计划 :722）：已投递记录保留 7 天后清理。
+    // - 只删 delivered=1：未投递的可能因 Redis 故障一直没发出去，
+    //   delivered=0 是"待办"不是"垃圾"，删了 = 任务永久丢失。
+    // - 时间判断交给 MySQL（DATE_SUB(NOW(), INTERVAL 7 DAY)）：
+    //   无注入面（无用户输入拼接），worker 不维护自己的时钟。
+    const char* sql =
+        "DELETE FROM outbox WHERE delivered=1 "
+        "AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)";
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = std::string("cleanup_outbox: ") + mysql_error(c);
+        return false;
+    }
+    if (deleted_rows) {
+        *deleted_rows = static_cast<int64_t>(mysql_affected_rows(c));
+    }
+    return true;
+}
+
 }  // namespace worker

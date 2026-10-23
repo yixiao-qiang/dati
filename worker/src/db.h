@@ -123,6 +123,13 @@ public:
     //   （status 已变 judging/终态），匹配 0 行，不误伤。
     bool revert_reset(int64_t submission_id, std::string* err);
 
+    // 清理已投递的 outbox 过期记录（N4，计划 :722：保留 7 天后清理）。
+    // 只删 delivered=1：delivered=0 可能因 Redis 故障一直没投出去，
+    // 删了 = 任务永久丢失（投递失败的消息由投递器下轮重试，不靠清理）。
+    // deleted_rows 出参 = 本次删除条数（可传 nullptr 忽略）。
+    // 返回 false = 数据库错误（本次清理作废，下轮重试）。
+    bool cleanup_outbox(int64_t* deleted_rows, std::string* err);
+
 private:
     void* conn_ = nullptr;  // MYSQL*
 };

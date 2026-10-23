@@ -43,6 +43,10 @@ constexpr int kRescueStaleMin = 10;        // judging 超时阈值（与判死�
 constexpr int kRescueMaxRetry = 3;         // 重试上限，超限转死信等人工
 // 台阶 4：Outbox 投递器（本地消息表 → Redis Stream）
 constexpr int64_t kOutboxScanMs = 2000;    // 每 2s 扫一次待投递消息
+// 台阶 4 收尾（N4）：Outbox 已投递记录 7 天清理周期。
+// 默认 10min（保留期 7 天，误差 10min 无感）；环境变量可覆盖，
+// 供验证脚本压缩时间尺度（与 OJ_CLAIM_IDLE_MS 同一模式，N3 教训）。
+const int64_t kOutboxCleanupMs = env_int64("OJ_OUTBOX_CLEANUP_MS", 600000);
 
 // 单调时钟（CLOCK_MONOTONIC）：不受系统改时间影响，只用于"过了多久"
 int64_t now_ms() {
@@ -140,6 +144,7 @@ int main() {
     int64_t last_claim_scan_ms = 0;    // 上次扫死任务的时间点
     int64_t last_rescue_scan_ms = 0;   // 上次扫卡死任务的时间点
     int64_t last_outbox_scan_ms = 0;   // 上次扫待投递消息的时间点
+    int64_t last_outbox_cleanup_ms = 0; // 上次清理 outbox 过期记录的时间点
     while (true) {
         // ---- 台阶 2：周期扫描死任务（XAUTOCLAIM 判死接管）----
         // 时机：每 5s 一次。被接管的消息走与正常消息完全相同的流程
@@ -254,6 +259,25 @@ int main() {
             } else {
                 std::fprintf(stderr, "fetch_undelivered 失败: %s\n", err.c_str());
                 // 不退出：投递失败下轮再试（消息还在 outbox，不丢）
+            }
+        }
+
+        // ---- 台阶 4 收尾：周期清理 outbox 已投递记录（N4）----
+        // 计划 :722：已投递记录保留 7 天后清理。outbox 是消息中转站，
+        // 只增不减会让表无限膨胀。只删 delivered=1——delivered=0 是
+        // "待办"（可能因 Redis 故障一直没投出去），删了 = 任务丢失。
+        // 周期 10min（OJ_OUTBOX_CLEANUP_MS 可覆盖）；7 天保留期误差无感。
+        if (now_ms() - last_outbox_cleanup_ms >= kOutboxCleanupMs) {
+            last_outbox_cleanup_ms = now_ms();
+            int64_t deleted = 0;
+            if (db.cleanup_outbox(&deleted, &err)) {
+                if (deleted > 0) {
+                    std::fprintf(stderr, "[outbox] 清理已投递过期记录 %lld 条\n",
+                                 (long long)deleted);
+                }
+            } else {
+                std::fprintf(stderr, "cleanup_outbox 失败: %s\n", err.c_str());
+                // 不退出：删除是维护操作，失败下轮再试，不影响投递
             }
         }
 
