@@ -130,3 +130,63 @@ def test_submit_returns_500_when_db_unavailable(client, monkeypatch):
     resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"})
     assert resp.status_code == 500
     assert "数据库" in resp.json()["detail"], "500 要给用户可行动的信息，不是裸错误"
+
+
+# ---------- 查询接口 ----------
+
+FULL_ROW = {
+    "id": 28,
+    "language": "cpp",
+    "status": "accepted",
+    "result": "accepted",
+    "stdout": "hi\n",
+    "stderr": "",
+    "created_at": None,
+}
+
+
+def test_get_submission_returns_200_with_full_fields(client, monkeypatch):
+    monkeypatch.setattr(main, "get_submission", lambda sid: FULL_ROW)
+
+    resp = client.get("/api/submission/28")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["submission_id"] == 28
+    assert body["status"] == "accepted"
+    assert body["result"] == "accepted"
+    assert body["stdout"] == "hi\n"
+    assert body["stderr"] == ""
+    assert "language" in body and "created_at" in body
+
+
+def test_get_submission_404_when_not_exists(client, monkeypatch):
+    monkeypatch.setattr(main, "get_submission", lambda sid: None)
+
+    resp = client.get("/api/submission/999")
+    assert resp.status_code == 404, "id 不存在必须 404——前端凭据错的信号"
+
+
+def test_get_submission_200_while_pending(client, monkeypatch):
+    """在途提交（pending）返回 200 而不是 404——区分"不存在"和"没判完"。"""
+    pending_row = dict(FULL_ROW, status="pending", result=None, stdout=None)
+    monkeypatch.setattr(main, "get_submission", lambda sid: pending_row)
+
+    resp = client.get("/api/submission/28")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pending"
+
+
+def test_get_submission_500_when_db_unavailable(client, monkeypatch):
+    def boom(sid):
+        raise pymysql.OperationalError("db is down")
+
+    monkeypatch.setattr(main, "get_submission", boom)
+
+    resp = client.get("/api/submission/28")
+    assert resp.status_code == 500
+
+
+def test_get_submission_rejects_non_numeric_id(client):
+    resp = client.get("/api/submission/abc")
+    assert resp.status_code == 422, "sid 声明为 int，pydantic 自动拒绝非数字（免费的类型校验）"

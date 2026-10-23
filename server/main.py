@@ -86,6 +86,49 @@ def submit(req: SubmitRequest):
     return {"submission_id": sid}
 
 
+def get_submission(sid: int) -> dict | None:
+    """读 submission 一行。不存在返回 None，调用方决定 404。
+
+    为什么查询走 DB 不走 Redis（面试点）：
+    - 状态唯一权威在 MySQL：worker 的 claim/finish/rescue 都写它
+    - Redis 只存"消息谁在处理"（PEL），不存状态——问状态永远问 DB
+    """
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, language, status, result, stdout, stderr, created_at "
+                "FROM submission WHERE id=%s",
+                (sid,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return row
+
+
+@app.get("/api/submission/{sid}")
+def submission_status(sid: int):
+    try:
+        row = get_submission(sid)
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+
+    if row is None:
+        # 404 = 凭据错；200+pending = 正常在途。两者必须分开（面试点）
+        raise HTTPException(status_code=404, detail=f"提交不存在: {sid}")
+
+    return {
+        "submission_id": row["id"],
+        "language": row["language"],
+        "status": row["status"],          # pending/judging/终态/dead——前端轮询的终止条件
+        "result": row["result"],
+        "stdout": row["stdout"],
+        "stderr": row["stderr"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
 # 静态页面（先丑后美，Wave 4 换 Vue3）
 app.mount(
     "/",
