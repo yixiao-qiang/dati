@@ -268,6 +268,54 @@ bool Db::fetch_code(int64_t submission_id, std::string* code, std::string* langu
     return true;
 }
 
+bool Db::fetch_limits(int64_t submission_id, int* time_ms, int* mem_mb, int* output_mb,
+                      std::string* err, bool* found) {
+    *found = false;
+    if (!conn_) {
+        if (err) *err = "未连接 MySQL";
+        return false;
+    }
+    MYSQL* c = static_cast<MYSQL*>(conn_);
+
+    // LEFT JOIN：submission 一定存在（fetch_code 已确认），problem 可能缺失
+    // （题目被删/没建）。限额属于题目——从 problem 表读，不再硬编码。
+    // 全部用整数字面量拼 SQL：无用户输入，无注入面。
+    char sql[256];
+    std::snprintf(sql, sizeof(sql),
+                  "SELECT p.time_limit_ms, p.mem_limit_mb, p.output_limit_mb "
+                  "FROM submission s LEFT JOIN problem p ON s.problem_id = p.id "
+                  "WHERE s.id=%lld",
+                  (long long)submission_id);
+
+    if (mysql_query(c, sql) != 0) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+    MYSQL_RES* res = mysql_store_result(c);
+    if (!res) {
+        if (err) *err = mysql_error(c);
+        return false;
+    }
+
+    MYSQL_ROW row = mysql_fetch_row(res);
+    if (!row) {
+        // 提交不存在（脏消息）——与 fetch_code 的 found=false 语义一致，调用方 ACK 丢弃
+        mysql_free_result(res);
+        return true;
+    }
+
+    // ★ 兜底策略（fail-safe）：题目缺失（LEFT JOIN 落空，三列全 NULL）时
+    //   用默认限额继续判——判题不因元数据缺失而失败；found 仍置 true，
+    //   让调用方继续正常流程（默认值与硬编码时代一致：1000ms/256MB/64MB）。
+    *time_ms   = row[0] ? std::atoi(row[0]) : 1000;
+    *mem_mb    = row[1] ? std::atoi(row[1]) : 256;
+    *output_mb = row[2] ? std::atoi(row[2]) : 64;
+
+    mysql_free_result(res);
+    *found = true;
+    return true;
+}
+
 bool Db::rescue_stale(int stale_minutes, int max_retry,
                       std::vector<int64_t>* reset_ids,
                       std::vector<int64_t>* dead_ids,

@@ -78,6 +78,10 @@ def test_create_submission_writes_both_tables_in_one_transaction(fake_conn):
     assert sqls[0].startswith("INSERT INTO submission"), "第一条是 submission"
     assert sqls[1].startswith("INSERT INTO outbox"), "第二条是 outbox"
     assert "status" in sqls[0] and "'pending'" in sqls[0], "提交初始状态 pending"
+    assert "problem_id" in sqls[0], "INSERT 带 problem_id 列"
+    sub_args = fake_conn.cursor_.executed[0][1]
+    assert sub_args[0] == 1, "默认 problem_id=1（限额从 problem 表读）"
+    assert sub_args[1] == "int main(){}" and sub_args[2] == "cpp", "code/language 顺序正确"
     outbox_args = fake_conn.cursor_.executed[1][1]
     assert outbox_args == (42,), "outbox 关联刚插入的 submission_id"
     assert "judged" in sqls[1] and "0" in sqls[1], "event=judged, delivered=0"
@@ -100,7 +104,7 @@ def test_create_submission_rolls_back_when_outbox_insert_fails(monkeypatch):
 # ---------- 接口校验 ----------
 
 def test_submit_returns_201_with_submission_id(client, monkeypatch):
-    monkeypatch.setattr(main, "create_submission", lambda code, lang: 42)
+    monkeypatch.setattr(main, "create_submission", lambda code, lang, pid: 42)
 
     resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"})
 
@@ -122,7 +126,7 @@ def test_submit_rejects_unsupported_language(client):
 
 
 def test_submit_returns_500_when_db_unavailable(client, monkeypatch):
-    def boom(code, lang):
+    def boom(code, lang, pid):
         raise pymysql.OperationalError("db is down")
 
     monkeypatch.setattr(main, "create_submission", boom)

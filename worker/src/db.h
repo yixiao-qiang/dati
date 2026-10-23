@@ -67,6 +67,15 @@ public:
     bool fetch_code(int64_t submission_id, std::string* code, std::string* language,
                     std::string* err, bool* found);
 
+    // 读回提交所属题目的限额（Wave 3 台阶4-3：替代硬编码 1000ms/256MB/64MB）。
+    // 语义与 fetch_code 对齐：
+    //   *found=false = 提交存在但没有题目/题目不存在 → 用默认限额兜底
+    //                  （判题不因元数据缺失而失败，fail-safe；found 置 true 让调用方继续判）
+    //   返回 false   = 数据库错误（不要 ACK，留 PEL 等重投）
+    // 限额属于题目：同一道题限额固定；submission.problem_id 是外键。
+    bool fetch_limits(int64_t submission_id, int* time_ms, int* mem_mb, int* output_mb,
+                      std::string* err, bool* found);
+
     // rescue 扫描：找出 judging 超时（judge_started_at 早于 NOW()-stale_minutes）的任务
     //   - retry_count < max_retry → 重置 pending + retry_count+1（让消息重投后能再次 claim）
     //   - retry_count >= max_retry → 转 dead（死信，人工介入，不再自动捞）

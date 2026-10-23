@@ -39,9 +39,10 @@ MAX_CODE_BYTES = 64 * 1024  # 64KB
 class SubmitRequest(BaseModel):
     code: str
     language: str = "cpp"
+    problem_id: int = 1  # 关联题目（限额从 problem 表读；学习期默认题 1）
 
 
-def create_submission(code: str, language: str) -> int:
+def create_submission(code: str, language: str, problem_id: int = 1) -> int:
     """一个事务写 submission + outbox，返回 submission_id。
 
     为什么同事务（台阶 1 核心设计决策）：
@@ -53,8 +54,9 @@ def create_submission(code: str, language: str) -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO submission (code, language, status) VALUES (%s, %s, 'pending')",
-                (code, language),
+                "INSERT INTO submission (problem_id, code, language, status) "
+                "VALUES (%s, %s, %s, 'pending')",
+                (problem_id, code, language),
             )
             sid = cur.lastrowid
             cur.execute(
@@ -79,7 +81,7 @@ def submit(req: SubmitRequest):
         raise HTTPException(status_code=400, detail=f"不支持的语言: {req.language}")
 
     try:
-        sid = create_submission(req.code, req.language)
+        sid = create_submission(req.code, req.language, req.problem_id)
     except pymysql.MySQLError:
         raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
 
@@ -87,12 +89,7 @@ def submit(req: SubmitRequest):
 
 
 def get_submission(sid: int) -> dict | None:
-    """读 submission 一行。不存在返回 None，调用方决定 404。
-
-    为什么查询走 DB 不走 Redis（面试点）：
-    - 状态唯一权威在 MySQL：worker 的 claim/finish/rescue 都写它
-    - Redis 只存"消息谁在处理"（PEL），不存状态——问状态永远问 DB
-    """
+    """根据 submission_id 查询提交状态。"""
     conn = pymysql.connect(**DB_CONFIG)
     try:
         with conn.cursor() as cur:

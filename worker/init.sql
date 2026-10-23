@@ -13,9 +13,24 @@ CREATE DATABASE IF NOT EXISTS oj
 
 USE oj;
 
+-- 题目表（Wave 3 台阶4-3：限额从 DB 读取，替代 worker 硬编码 1000ms/256MB/64MB）
+-- 限额属于题目：同一道题限额固定；submission.problem_id 外键记录"做的哪道题"
+CREATE TABLE IF NOT EXISTS problem (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(128) NOT NULL,                 -- 题目标题
+    time_limit_ms INT NOT NULL DEFAULT 1000,     -- 时间限额（毫秒）
+    mem_limit_mb INT NOT NULL DEFAULT 256,       -- 内存限额（MB）
+    output_limit_mb INT NOT NULL DEFAULT 64      -- 输出限额（MB）
+) ENGINE=InnoDB;
+
+-- 学习期默认题：无题目管理页面，提交默认挂 id=1
+INSERT IGNORE INTO problem (id, title, time_limit_ms, mem_limit_mb, output_limit_mb)
+VALUES (1, 'A+B', 1000, 256, 64);
+
 -- 判题提交表：一条记录 = 用户一次提交，从 pending 走到某个终态
 CREATE TABLE IF NOT EXISTS submission (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,        -- 提交 ID（Redis 消息载荷）
+    problem_id BIGINT NOT NULL DEFAULT 1,        -- 关联题目（限额从 problem 表读）
     code MEDIUMTEXT NOT NULL,                    -- 用户源码（server 限制 64KB，MEDIUMTEXT 16MB 富余）
     language VARCHAR(16) NOT NULL DEFAULT 'cpp', -- 语言（白名单 cpp/c）
     status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 状态机当前位置（pending/judging/终态/dead 死信）
@@ -25,7 +40,8 @@ CREATE TABLE IF NOT EXISTS submission (
     stdout MEDIUMTEXT NULL,                      -- 判题输出（worker 截断后写入）
     stderr MEDIUMTEXT NULL,                      -- 判题错误输出
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    KEY idx_status (status)                      -- 条件更新走索引，不扫全表
+    KEY idx_status (status),                     -- 条件更新走索引，不扫全表
+    KEY idx_problem (problem_id)
 ) ENGINE=InnoDB;
 
 -- 专用账号：oj / oj123456（学习期口令，生产必须换强口令 + 最小权限）

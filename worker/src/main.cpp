@@ -81,7 +81,19 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
 
     worker::JudgeOutcome out;
     // 真判题：编译(沙箱外 g++) + judge_main(沙箱内) → 填 out
-    // 限额学习期硬编码 1000ms/256MB/64MB —— 正式版应从 DB/题目表读取
+    // 限额来自 DB（台阶4-3）：problem 表每题的 time/mem/output 限额，
+    // 替代硬编码 1000/256/64——题目改限额即时生效，worker 无需重编译。
+    // 题目缺失时 fetch_limits 兜底默认值（fail-safe，判题不因元数据缺失失败）。
+    int time_ms = 1000, mem_mb = 256, output_mb = 64;
+    bool limits_ok = false;
+    if (!db.fetch_limits(m.submission_id, &time_ms, &mem_mb, &output_mb, &err,
+                         &limits_ok)) {
+        std::fprintf(stderr, "fetch_limits 失败(id=%lld): %s\n",
+                     (long long)m.submission_id, err.c_str());
+        return;  // DB 错误：不 ACK 留 PEL 等重投（沿用不吞错纪律）
+    }
+    std::fprintf(stderr, "[judge] id=%lld 限额 time=%dms mem=%dMB output=%dMB\n",
+                 (long long)m.submission_id, time_ms, mem_mb, output_mb);
     // ★ D3：判题循环内周期心跳——judge_code 阻塞期间 run_capture 每 30s 调
     //   一次回调 reset_idle，防止长任务（未来大工程编译/判题机负载高）消息
     //   idle 涨过 10min 判死阈值被误判死。主循环此刻被阻塞，只有回调能续命。
@@ -89,7 +101,7 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     //   若 Redis 连接已断，静默失败会让心跳在最需要它的时候失效且无迹可查
     //   （违背"不吞错"纪律）。30s 一次，打日志不会刷屏。
     std::string hb_err;
-    if (!judge_code(code, lang, judge_main, 1000, 256, 64, &out, &err,
+    if (!judge_code(code, lang, judge_main, time_ms, mem_mb, output_mb, &out, &err,
                     [&] {
                         hb_err.clear();
                         if (!q.reset_idle(consumer_id, m.id, &hb_err)) {
