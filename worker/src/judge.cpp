@@ -16,10 +16,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
 #include <cerrno>
+#include <cstddef>
 #include <fcntl.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -37,32 +39,83 @@ int64_t now_ms() {
     return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
-// ================= 工具：JSON 字段提取（学习期简化）=================
-// 提取字符串字段："key" : "value"（容忍冒号后空格——
-//  judge_main 输出 {"status": "OK"}，冒号后有空格，旧写法匹配不上）
-std::string json_str(const std::string& json, const std::string& key) {
-    std::string pat = "\"" + key + "\"";
-    size_t p = json.find(pat);
-    if (p == std::string::npos) return "";
-    p += pat.size();
-    while (p < json.size() && (json[p] == ':' || json[p] == ' ')) ++p;  // 跳过 : 和空格
-    if (p >= json.size() || json[p] != '"') return "";
-    ++p;  // 跳过开引号
-    size_t e = json.find('"', p);
-    if (e == std::string::npos) return "";
-    return json.substr(p, e - p);
+// ================= 工具：扁平 JSON 对象解析（学习期简化，但转义正确）=================
+// judge_main 输出是我们自己 printf 的扁平 JSON（一层键值对，值只有 string/number）。
+// 不引入 nlohmann/json（VM 无三方库），但**必须**把字符串值的转义引号解析对——
+// 旧的 find("\"key\"") + find('"') 子串查找会在值内第一个转义引号处截断：
+// 用户程序输出 say "hi" → JSON 值为 "say \"hi\"" → 旧解析取到 "say \" →
+// 与期望输出比对失败 → 必误判 WA（审查 P1-1，真实事故级缺陷）。单测锁死。
+
+// 前向声明：unescape 定义在本匿名命名空间后面，这里先用（键名还原用）
+std::string unescape(const std::string& s);
+
+// 跳过空白（空格/制表/换行/回车）
+size_t json_skip_ws(const std::string& s, size_t i) {
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+        ++i;
+    }
+    return i;
 }
 
-// 提取数字字段："key":123（容忍冒号后空格）
-std::string json_num(const std::string& json, const std::string& key) {
-    std::string pat = "\"" + key + "\"";
-    size_t p = json.find(pat);
-    if (p == std::string::npos) return "";
-    p += pat.size();
-    while (p < json.size() && (json[p] == ':' || json[p] == ' ')) ++p;  // 跳过 : 和空格
-    size_t e = json.find_first_of(",}", p);
-    if (e == std::string::npos) return "";
-    return json.substr(p, e - p);
+// 扫描一个带引号的 JSON 字符串（要求 s[i] == '"'）。
+// raw 输出原始内容（保留 \" \n 等转义序列，由 unescape 还原）；
+// *i 前进到闭合引号之后。转义引号被整体跳过——这是修复截断的关键。
+// 格式非法（未闭合引号）返回 false。
+bool json_scan_string(const std::string& s, size_t* i, std::string* raw) {
+    if (*i >= s.size() || s[*i] != '"') return false;
+    ++*i;
+    while (*i < s.size()) {
+        const char c = s[*i];
+        if (c == '\\' && *i + 1 < s.size()) {
+            *raw += c;
+            *raw += s[*i + 1];
+            *i += 2;
+            continue;
+        }
+        if (c == '"') {
+            ++*i;
+            return true;
+        }
+        *raw += c;
+        ++*i;
+    }
+    return false;  // 读到结尾都没等到闭合引号
+}
+
+// 解析扁平 JSON 对象到 map（key 已 unescape，value 保留原始转义文本）。
+// 顺序解析：值内出现 "status": "WA" 这类伪键值对文本也不会被当成键。
+bool json_parse_flat(const std::string& json,
+                     std::map<std::string, std::string>* out) {
+    size_t i = json.find('{');
+    if (i == std::string::npos) return false;
+    i = json_skip_ws(json, i + 1);
+    if (i < json.size() && json[i] == '}') return true;  // "{}" 空对象
+    while (i < json.size()) {
+        std::string key_raw;
+        if (!json_scan_string(json, &i, &key_raw)) return false;
+        i = json_skip_ws(json, i);
+        if (i >= json.size() || json[i] != ':') return false;
+        i = json_skip_ws(json, i + 1);
+        std::string val_raw;
+        if (i < json.size() && json[i] == '"') {
+            if (!json_scan_string(json, &i, &val_raw)) return false;
+        } else {
+            // 数字/字面量：读到 , 或 } 为止
+            const size_t e = json.find_first_of(",}", i);
+            if (e == std::string::npos) return false;
+            val_raw = json.substr(i, e - i);
+            i = e;
+        }
+        (*out)[unescape(key_raw)] = val_raw;
+        i = json_skip_ws(json, i);
+        if (i < json.size() && json[i] == ',') {
+            i = json_skip_ws(json, i + 1);
+            continue;
+        }
+        return i < json.size() && json[i] == '}';
+    }
+    return false;
 }
 
 // 最简 unescape：把 JSON 转义还原成原始文本（学习期只处理常见的四种）
@@ -293,6 +346,27 @@ bool compile_code(const std::string& code, const std::string& lang,
 }  // namespace
 
 // ---- D4 导出：内部纯函数（声明见 internal.h，供单元测试）----
+
+// 取字符串字段（已 unescape）。字段缺失/JSON 非法 → 空串（fail-closed：
+// 调用方 parse_status 对空串落 SystemError，不猜）
+std::string json_field_str(const std::string& json, const std::string& key) {
+    std::map<std::string, std::string> m;
+    if (!json_parse_flat(json, &m)) return "";
+    const auto it = m.find(key);
+    return it == m.end() ? "" : unescape(it->second);
+}
+
+// 取数字字段的原始文本（调用方 atoi/atoll）。缺失/非法 → 空串（atoi("")==0）
+std::string json_field_num(const std::string& json, const std::string& key) {
+    std::map<std::string, std::string> m;
+    if (!json_parse_flat(json, &m)) return "";
+    const auto it = m.find(key);
+    if (it == m.end()) return "";
+    const std::string& v = it->second;   // 尾部可能带空白（", " 分隔），去尾
+    const size_t e = v.find_last_not_of(" \t\r\n");
+    return e == std::string::npos ? "" : v.substr(0, e + 1);
+}
+
 // judge_main 输出 "OK"/"WA"/"TLE"...，映射到 db.h 的枚举（与 finish 对齐）
 // 未知字符串 → SystemError（fail-closed：读不懂就当系统错误，不猜）
 JudgeStatus parse_status(const std::string& s) {
@@ -380,15 +454,15 @@ bool judge_code(const std::string& code, const std::string& language,
             return true;
         }
 
-        const JudgeStatus st = parse_status(json_str(json, "status"));
-        outcome->exit_code  = std::atoi(json_num(json, "exit_code").c_str());
-        outcome->signal     = std::atoi(json_num(json, "signal").c_str());
-        outcome->cpu_us     = std::atoll(json_num(json, "cpu_us").c_str());
-        outcome->mem_bytes  = std::atoll(json_num(json, "mem_bytes").c_str());
-        outcome->wall_us    = std::atoll(json_num(json, "wall_us").c_str());
-        outcome->stdout_text = unescape(json_str(json, "stdout"));
-        outcome->stderr_text = unescape(json_str(json, "stderr"));
-        outcome->error_msg  = unescape(json_str(json, "error_msg"));
+        const JudgeStatus st = parse_status(json_field_str(json, "status"));
+        outcome->exit_code  = std::atoi(json_field_num(json, "exit_code").c_str());
+        outcome->signal     = std::atoi(json_field_num(json, "signal").c_str());
+        outcome->cpu_us     = std::atoll(json_field_num(json, "cpu_us").c_str());
+        outcome->mem_bytes  = std::atoll(json_field_num(json, "mem_bytes").c_str());
+        outcome->wall_us    = std::atoll(json_field_num(json, "wall_us").c_str());
+        outcome->stdout_text = json_field_str(json, "stdout");
+        outcome->stderr_text = json_field_str(json, "stderr");
+        outcome->error_msg  = json_field_str(json, "error_msg");
 
         // ★ 判定（台阶 2 核心）：OK 只证明"程序跑完没崩"，对错靠输出比对
         if (st == JudgeStatus::Accepted &&

@@ -36,4 +36,13 @@ std::string escape_sql(void* conn, const std::string& raw);
 JudgeStatus parse_status(const std::string& s);
 
 bool output_matches(const std::string& expected, const std::string& actual);
+
+// 扁平 JSON 对象字段提取（judge_main 输出的解析，顺序解析、转义正确）。
+// json_field_str 返回已 unescape 的字符串值；json_field_num 返回数字的
+// 原始文本（调用方 atoi/atoll）。字段缺失/JSON 非法 → 空串（fail-closed：
+// status 解析不出 → parse_status("") → SystemError，不猜）。
+// ★ 为什么导出：旧的子串查找在值内第一个转义引号处截断（输出含 " 必误判
+//   WA，审查 P1-1），解析器是判题正确性的关键纯函数，必须有单测锁死。
+std::string json_field_str(const std::string& json, const std::string& key);
+std::string json_field_num(const std::string& json, const std::string& key);
 }  // namespace worker

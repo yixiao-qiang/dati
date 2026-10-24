@@ -133,6 +133,50 @@ void test_judge_status_to_string() {
     CHECK(worker::parse_status(worker::judge_status_to_string(JudgeStatus::Dead)) == JudgeStatus::SystemError);
 }
 
+void test_json_fields() {
+    using worker::json_field_str;
+    using worker::json_field_num;
+    // judge_main 真实输出形状（冒号后带空格）
+    const std::string j =
+        "{"
+        "\"status\": \"OK\", "
+        "\"exit_code\": 0, "
+        "\"signal\": 9, "
+        "\"cpu_us\": 123456, "
+        "\"stdout\": \"say \\\"hi\\\"\", "
+        "\"stderr\": \"\", "
+        "\"error_msg\": \"\""
+        "}";
+
+    CHECK(json_field_str(j, "status") == "OK");
+    CHECK(json_field_num(j, "exit_code") == "0");
+    CHECK(json_field_num(j, "signal") == "9");
+    CHECK(json_field_num(j, "cpu_us") == "123456");
+    // ★ 审查 P1-1：值内转义引号不得截断——旧子串解析取到 "say \" → 必误判 WA
+    CHECK(json_field_str(j, "stdout") == "say \"hi\"");
+    CHECK(json_field_str(j, "stderr") == "");
+
+    // 值内出现"伪键值对"文本：顺序解析不会把值内文本当键
+    const std::string tricky =
+        "{\"status\": \"OK\", \"stdout\": \"x \\\"status\\\": \\\"WA\\\" y\", "
+        "\"error_msg\": \"e\"}";
+    CHECK(json_field_str(tricky, "stdout") == "x \"status\": \"WA\" y");
+    CHECK(json_field_str(tricky, "error_msg") == "e");
+    CHECK(json_field_str(tricky, "status") == "OK");
+
+    // 换行/制表转义还原
+    CHECK(json_field_str("{\"stdout\": \"a\\nb\\tc\"}", "stdout") == "a\nb\tc");
+
+    // 缺失字段 / 非法 JSON → 空串（fail-closed，parse_status 落 SystemError）
+    CHECK(json_field_str("{\"status\": \"OK\"}", "stdout") == "");
+    CHECK(json_field_str("not json at all", "status") == "");
+    CHECK(json_field_num("{\"signal\": 7}", "exit_code") == "");
+    CHECK(json_field_str("{\"stdout\": \"unterminated", "stdout") == "");
+
+    // 负数与空格容错
+    CHECK(json_field_num("{\"exit_code\": -1, \"signal\": 0}", "exit_code") == "-1");
+}
+
 void test_output_matches() {
     // 精确相等
     CHECK(worker::output_matches("hi\n", "hi\n"));
@@ -173,6 +217,7 @@ int main() {
     test_escape_sql();
     test_parse_status();
     test_judge_status_to_string();
+    test_json_fields();
     test_output_matches();
     test_judge_outcome_default();
 
