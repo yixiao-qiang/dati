@@ -4,6 +4,17 @@
 
 # ===== 本地工具目录 =====
 .rivet/
+.lark-slides/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ===== 个人文档（不入公开仓库）=====
+曾盛强-*
+项目介绍_*.txt
+项目经历_*.md
 
 # ===== 构建产物与测试输出 =====
 tests/smoke/build/
