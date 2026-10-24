@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <fcntl.h>
+#include <sys/resource.h>   // setrlimit/RLIMIT_*（编译子进程资源限制）
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -147,6 +148,35 @@ std::string unescape(const std::string& s) {
 // capture_stderr：true=stderr 合并进管道（编译用，错误信息要捕获）；
 //                 false=stderr 继承父进程（运行 judge_main 用，
 //                       JSON 只从 stdout 读，自身 stderr 直接上 worker 日志）
+// 子进程资源限制（fork 后、exec 前套用；0 = 不限）。编译路径必设：
+// 恶意模板递归（template<int N> struct X{X<N-1> x;};）能让 g++ 吃数 GB
+// 内存 OOM 整机——判题机不能被一份源码打挂。judge_main 路径不设：
+// 用户程序的限制由沙箱自己的 cgroup/RLIMIT 管，套在 judge_main 上会
+// 连累沙箱计量（内存限额会被外层先触发）。
+struct ChildLimits {
+    int64_t address_space_mb = 0;  // RLIMIT_AS：进程虚拟内存上限
+    int cpu_sec = 0;               // RLIMIT_CPU：CPU 秒数（超限 SIGKILL）
+    int64_t fsize_mb = 0;          // RLIMIT_FSIZE：可写文件大小上限
+};
+
+// 把限制套到当前进程（fork 后 exec 前的子进程分支调用）
+// 失败即 _exit：套不上限制就不能 exec（宁可判 system_error 也不能裸跑）
+void apply_child_limits(const ChildLimits& lim) {
+    struct rlimit rl;
+    if (lim.address_space_mb > 0) {
+        rl = {lim.address_space_mb * 1024 * 1024, lim.address_space_mb * 1024 * 1024};
+        if (setrlimit(RLIMIT_AS, &rl) != 0) _exit(126);
+    }
+    if (lim.cpu_sec > 0) {
+        rl = {lim.cpu_sec, lim.cpu_sec};
+        if (setrlimit(RLIMIT_CPU, &rl) != 0) _exit(126);
+    }
+    if (lim.fsize_mb > 0) {
+        rl = {lim.fsize_mb * 1024 * 1024, lim.fsize_mb * 1024 * 1024};
+        if (setrlimit(RLIMIT_FSIZE, &rl) != 0) _exit(126);
+    }
+}
+
 // heartbeat（D3）：判题处理期间每 kHeartbeatIntervalMs 调一次的可选回调。
 //   为什么需要：run_capture 阻塞时主循环没有机会 reset_idle，长任务消息的
 //   idle 会涨过判死阈值被 XAUTOCLAIM 误判死；回调在轮询循环里周期续命。
@@ -160,7 +190,8 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
                 bool capture_stderr,
                 std::string* output, int* status_out, std::string* err,
                 const std::function<void()>& heartbeat = {},
-                const std::string* child_input = nullptr) {
+                const std::string* child_input = nullptr,
+                const ChildLimits& limits = {}) {
     // 忽略 SIGPIPE：child_input 写入时子进程可能已退出（EPIPE），
     // 默认 SIGPIPE 会直接杀死 worker 整个进程——判题机不能被一个死子进程带走
     signal(SIGPIPE, SIG_IGN);
@@ -200,6 +231,8 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
         }
         close(pipefd[0]);
         close(pipefd[1]);
+        // 资源限制必须在 exec 前套：exec 后就是 g++/judge_main 的进程，晚了
+        apply_child_limits(limits);
         // vector<string> → char* 数组（execvp 需要，末尾 nullptr）
         std::vector<char*> cargv;
         cargv.reserve(argv.size() + 1);
@@ -345,8 +378,17 @@ bool compile_code(const std::string& code, const std::string& lang,
 
     std::string output;
     int status = 0;
+    // ★ 编译资源限制（审查 P1-4）：恶意模板递归可让 g++ 吃数 GB 内存 OOM 整机。
+    //   RLIMIT_AS 2GB（正常 -O2 编译 <512MB，重模板题也不超 2GB）；
+    //   RLIMIT_CPU 20s（墙钟 30s 留余量，CPU 限先杀省资源）；
+    //   RLIMIT_FSIZE 256MB（巨型静态数组编出的目标文件/临时文件封顶，
+    //   超限 g++ 被 SIGXFSZ 杀 → 落 CE 分支，属用户代码问题）。
+    const ChildLimits compile_limits = {/*address_space_mb=*/2048,
+                                        /*cpu_sec=*/20,
+                                        /*fsize_mb=*/256};
     // capture_stderr=true：编译错误（g++ 写 stderr）必须捕获
-    const int rc = run_capture(argv, 30000, true, &output, &status, err);
+    const int rc = run_capture(argv, 30000, true, &output, &status, err,
+                               {}, nullptr, compile_limits);
 
     if (rc == -1) {             // 内部故障：管道/fork 失败
         unlink(src.c_str());
