@@ -2,24 +2,44 @@
 <html lang="zh">
 <head>
   <meta charset="UTF-8">
-  <title>OJ 判题 · Wave 3 异步判题</title>
+  <title>OJ 判题 · Wave 5 异步判题</title>
   <style>
     body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; }
     h1 { font-size: 20px; }
+    h2 { font-size: 16px; margin-top: 28px; }
     textarea { width: 100%; height: 240px; font-family: monospace; font-size: 14px; }
     .row { margin: 12px 0; }
     button { padding: 8px 24px; font-size: 14px; cursor: pointer; }
     button:disabled { cursor: not-allowed; opacity: 0.6; }
+    input { padding: 6px; font-size: 14px; }
     #result { margin-top: 16px; white-space: pre-wrap; background: #f4f4f4; padding: 12px; border-radius: 4px; }
     .meta { color: #666; font-size: 12px; }
+    #authPanel, #userPanel { margin: 12px 0; padding: 12px; background: #eef; border-radius: 4px; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #999; padding: 4px 8px; text-align: left; }
   </style>
 </head>
 <body>
   <h1>在线判题 · 异步判题</h1>
   <p class="meta">提交 → 入队 → worker 判题 → 轮询结果（2s）</p>
 
+  <!-- Wave 5 台阶 4：认证面板（未登录时显示表单；已登录显示用户名+登出） -->
+  <div id="authPanel">
+    用户名 <input id="username" placeholder="3-20 位字母/数字/下划线">
+    密码 <input id="password" type="password" placeholder="至少 8 位">
+    <button onclick="auth('login')">登录</button>
+    <button onclick="auth('register')">注册</button>
+    <span id="authMsg" class="meta"></span>
+  </div>
+  <div id="userPanel" style="display:none">
+    欢迎，<span id="welcomeUser"></span>
+    <button onclick="logout()">登出</button>
+  </div>
+
   <form id="form">
     <div class="row">
+      <!-- Wave 5 台阶 4：题目下拉，页面加载时从 GET /api/problems 填充 -->
+      <select id="problem"></select>
       <select id="language">
         <option value="cpp">C++</option>
         <option value="c">C</option>
@@ -36,6 +56,13 @@ int main() {
   </form>
 
   <div id="result">（结果会显示在这里）</div>
+
+  <!-- Wave 5 台阶 4：排行榜（GET /api/rank，只读查询无需登录） -->
+  <h2>排行榜</h2>
+  <table>
+    <thead><tr><th>#</th><th>用户</th><th>AC</th><th>罚时(min)</th></tr></thead>
+    <tbody id="rankBody"></tbody>
+  </table>
 
   <script>
     // 轮询终止条件：status 进入这些状态即停止（面试点：dead 也是终态！）
@@ -58,25 +85,121 @@ int main() {
     // 未同步进 TERMINAL 时再次出现无限轮询（fail-closed）
     const MAX_POLL_TRIES = 60;
 
+    // ============ Wave 5 台阶 4：认证（localStorage + Authorization 头） ============
+    // 为什么 localStorage：token 需要在刷新页面后仍可用（sessionStorage 关标签就丢）；
+    // 为什么不是 cookie：token 是给 JS fetch 手动带的，localStorage 最直接。
+    // 面试点：XSS 能读到 localStorage——生产上 httpOnly cookie + CSRF 防护是更优解，
+    // 学习期接受 localStorage 的简单性（无 XSS 面）。
+    const TOKEN_KEY = 'oj_token';
+    const USER_KEY = 'oj_username';
+
+    function getToken() { return localStorage.getItem(TOKEN_KEY); }
+
+    // 统一 fetch 封装：有 token 就带 Authorization 头
+    async function api(method, url, body) {
+      const headers = { 'Content-Type': 'application/json' };
+      const token = getToken();
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      const resp = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let data = null;
+      try { data = await resp.json(); } catch (e) { /* 非 JSON 响应 */ }
+      return { ok: resp.ok, status: resp.status, data };
+    }
+
+    async function auth(kind) {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      const authMsg = document.getElementById('authMsg');
+      const { ok, data } = await api('POST', '/api/' + kind, { username, password });
+      if (!ok) { authMsg.textContent = (data && data.detail) || '请求失败'; return; }
+      if (kind === 'register') {
+        // 注册成功自动登录（体验：不用用户注册完再手动登录一次）
+        const r2 = await api('POST', '/api/login', { username, password });
+        if (!r2.ok) { authMsg.textContent = '注册成功，自动登录失败，请手动登录'; return; }
+        localStorage.setItem(TOKEN_KEY, r2.data.token);
+        localStorage.setItem(USER_KEY, username);
+      } else {
+        localStorage.setItem(TOKEN_KEY, data.token);
+        localStorage.setItem(USER_KEY, data.username);
+      }
+      refreshAuth();
+    }
+
+    async function logout() {
+      await api('POST', '/api/logout');   // 幂等：token 已过期也 200
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(USER_KEY);
+      refreshAuth();
+    }
+
+    function refreshAuth() {
+      const token = getToken();
+      document.getElementById('authPanel').style.display = token ? 'none' : 'block';
+      document.getElementById('userPanel').style.display = token ? 'block' : 'none';
+      if (token) document.getElementById('welcomeUser').textContent =
+        localStorage.getItem(USER_KEY) || '（未知）';
+    }
+
+    // ============ 题目下拉 + 排行榜加载 ============
+    async function loadProblems() {
+      const { ok, data } = await api('GET', '/api/problems');
+      if (!ok || !data) return;
+      const sel = document.getElementById('problem');
+      data.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = `#${p.id} ${p.title}`;
+        sel.appendChild(opt);
+      });
+    }
+
+    async function loadRank() {
+      const { ok, data } = await api('GET', '/api/rank');
+      if (!ok || !data) return;
+      const tbody = document.getElementById('rankBody');
+      data.forEach((r, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          `<td>${i + 1}</td><td>${r.username}</td>` +
+          `<td>${r.ac_count}</td><td>${r.penalty_minutes}</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+
     const form = document.getElementById('form');
     const btn = document.getElementById('btn');
     const result = document.getElementById('result');
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      // Wave 5 台阶 4：写接口必须认证——未登录直接引导登录，不发请求
+      if (!getToken()) {
+        result.textContent = '请先登录后再提交';
+        refreshAuth();
+        return;
+      }
       btn.disabled = true;               // 防重复提交：前端第一道幂等防线
       result.textContent = '提交中…';
       try {
-        const resp = await fetch('/api/submit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            code: document.getElementById('code').value,
-            language: document.getElementById('language').value,
-          }),
+        const { ok, status, data } = await api('POST', '/api/submit', {
+          code: document.getElementById('code').value,
+          language: document.getElementById('language').value,
+          problem_id: parseInt(document.getElementById('problem').value, 10) || 1,
         });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.detail || '提交失败');
+        if (status === 401) {
+          // token 过期/失效：清掉本地，引导重新登录（写要认证、查询开放的语义）
+          result.textContent = '登录已过期，请重新登录';
+          localStorage.removeItem(TOKEN_KEY);
+          localStorage.removeItem(USER_KEY);
+          refreshAuth();
+          btn.disabled = false;
+          return;
+        }
+        if (!ok) throw new Error(data.detail || '提交失败');
         result.textContent = `已提交，编号 #${data.submission_id}，等待判题…`;
         poll(data.submission_id);
       } catch (err) {
@@ -129,6 +252,11 @@ int main() {
       ];
       result.textContent = lines.join('\n');
     }
+
+    // 页面加载：恢复登录态、拉题目、拉排行榜
+    refreshAuth();
+    loadProblems();
+    loadRank();
   </script>
 </body>
 </html>
