@@ -22,6 +22,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <csignal>           // signal(SIGPIPE, SIG_IGN)
 #include <fcntl.h>
 #include <sys/resource.h>   // setrlimit/RLIMIT_*（编译子进程资源限制）
 #include <sys/time.h>
@@ -161,18 +162,25 @@ struct ChildLimits {
 
 // 把限制套到当前进程（fork 后 exec 前的子进程分支调用）
 // 失败即 _exit：套不上限制就不能 exec（宁可判 system_error 也不能裸跑）
+// 显式 rlim_t 转换：花括号初始化里的 int64_t→rlim_t 是收窄转换（编译错误）
 void apply_child_limits(const ChildLimits& lim) {
     struct rlimit rl;
     if (lim.address_space_mb > 0) {
-        rl = {lim.address_space_mb * 1024 * 1024, lim.address_space_mb * 1024 * 1024};
+        const rlim_t v = static_cast<rlim_t>(lim.address_space_mb) * 1024 * 1024;
+        rl.rlim_cur = v;
+        rl.rlim_max = v;
         if (setrlimit(RLIMIT_AS, &rl) != 0) _exit(126);
     }
     if (lim.cpu_sec > 0) {
-        rl = {lim.cpu_sec, lim.cpu_sec};
+        const rlim_t v = static_cast<rlim_t>(lim.cpu_sec);
+        rl.rlim_cur = v;
+        rl.rlim_max = v;
         if (setrlimit(RLIMIT_CPU, &rl) != 0) _exit(126);
     }
     if (lim.fsize_mb > 0) {
-        rl = {lim.fsize_mb * 1024 * 1024, lim.fsize_mb * 1024 * 1024};
+        const rlim_t v = static_cast<rlim_t>(lim.fsize_mb) * 1024 * 1024;
+        rl.rlim_cur = v;
+        rl.rlim_max = v;
         if (setrlimit(RLIMIT_FSIZE, &rl) != 0) _exit(126);
     }
 }
