@@ -760,3 +760,60 @@ def test_submit_passes_user_id_to_create_submission(client, monkeypatch, auth_ct
                        headers=auth_ctx)
     assert resp.status_code == 201
     assert captured["uid"] == 7, "认证上下文 user_id=7 必须透传到落库"
+
+
+# ================= Wave 5 台阶 3 · 排行榜 =================
+
+def test_get_rank_sql_enforces_rank_semantics(fake_conn):
+    """SQL 口径锁死（任务书写死的 4 条，任何一条被改测试立刻红）：
+
+    1. 只统计 accepted + user_id 非空（老提交不进榜）
+    2. 每 (user_id, problem_id) 首次 AC（MIN(created_at)）——重复 AC 不叠加
+    3. 罚时 = AC 前非 AC 提交数 × 20min（丢时间项，无 contest 表）
+    4. 排序：AC 数降序 → 罚时升序 → user_id
+    """
+    main.get_rank()
+    sql = fake_conn.cursor_.executed[0][0]
+
+    assert "status = 'accepted'" in sql, "只统计 AC 提交"
+    assert "user_id IS NOT NULL" in sql, "user_id 为空的提交（老数据）必须排除"
+    assert "MIN(created_at)" in sql, "首次 AC 必须按 MIN(created_at) 取"
+    assert "GROUP BY user_id, problem_id" in sql, "按 (user, problem) 聚合去重"
+    assert "s.created_at < f.fa" in sql, "罚时只数 AC 前的提交"
+    assert "s.status != 'accepted'" in sql, "罚时排除 AC 本身"
+    assert "* 20" in sql, "罚时按 20min/次"
+    assert "ORDER BY ac_count DESC, penalty_minutes ASC" in sql, \
+        "排序：AC 降序 → 罚时升序"
+    assert "u.id ASC" in sql, "同分按 user_id 升序（稳定排名）"
+    assert "JOIN first_ac" in sql, "罚时子查询必须 JOIN 首次 AC 表（口径复用）"
+
+
+def test_rank_endpoint_200(client, monkeypatch):
+    fake_rank = [
+        {"id": 13, "username": "rankA", "ac_count": 2, "penalty_minutes": 40},
+        {"id": 14, "username": "rankB", "ac_count": 1, "penalty_minutes": 20},
+    ]
+    monkeypatch.setattr(main, "get_rank", lambda: fake_rank)
+    resp = client.get("/api/rank")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    assert body[0]["ac_count"] == 2 and body[0]["penalty_minutes"] == 40, \
+        "第一名：AC 最多、罚时最少"
+    assert body[1]["username"] == "rankB"
+
+
+def test_rank_endpoint_500_when_db_unavailable(client, monkeypatch):
+    def boom():
+        raise pymysql.OperationalError("db is down")
+
+    monkeypatch.setattr(main, "get_rank", boom)
+    resp = client.get("/api/rank")
+    assert resp.status_code == 500
+
+
+def test_rank_endpoint_200_unauthenticated(client, monkeypatch):
+    """排行榜是只读查询，不挂 auth（与 GET /api/submission 一致，查询开放）。"""
+    monkeypatch.setattr(main, "get_rank", lambda: [])
+    resp = client.get("/api/rank")
+    assert resp.status_code == 200, "无 token 也应能看排行榜（查询开放）"

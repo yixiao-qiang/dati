@@ -373,6 +373,53 @@ def get_submission(sid: int) -> Optional[dict]:
     return row
 
 
+# ============ 排行榜（Wave 5 台阶 3）============
+# 口径（显式决策，任务书写死）：
+#   1. 只统计 status='accepted' AND user_id IS NOT NULL——
+#      老提交/认证上线前的数据不进榜（user_id NULL 无法归属用户）
+#   2. 每 (user_id, problem_id) 只算首次 AC（MIN(created_at)）——
+#      同用户重复 AC 同一题不叠加题数（ACM 规则）
+#   3. 罚时 = Σ(该题 AC 前的非 AC 提交数 × 20min)——丢时间项：
+#      ACM 完整罚时还需"AC 时刻 - 比赛开始"，无 contest 表没有时间原点，
+#      只保留可复现的失败次数部分（任务书写死的简化）
+#   4. 排序：AC 数降序 → 罚时升序 → user_id（ACM 排名规则）
+# 为什么 CTE：first_ac 表在"数题数"和"算罚时"两处复用，WITH 一次定义多次引用
+RANK_SQL = """
+WITH first_ac AS (
+    SELECT user_id, problem_id, MIN(created_at) AS fa
+    FROM submission
+    WHERE status = 'accepted' AND user_id IS NOT NULL
+    GROUP BY user_id, problem_id
+),
+penalty AS (
+    SELECT s.user_id, s.problem_id, COUNT(*) AS fails
+    FROM submission s
+    JOIN first_ac f ON s.user_id = f.user_id AND s.problem_id = f.problem_id
+    WHERE s.created_at < f.fa AND s.status != 'accepted'
+    GROUP BY s.user_id, s.problem_id
+)
+SELECT u.id, u.username,
+       COUNT(f.problem_id) AS ac_count,
+       COALESCE(SUM(p.fails * 20), 0) AS penalty_minutes
+FROM users u
+LEFT JOIN first_ac f ON f.user_id = u.id
+LEFT JOIN penalty p ON p.user_id = u.id AND p.problem_id = f.problem_id
+GROUP BY u.id, u.username
+ORDER BY ac_count DESC, penalty_minutes ASC, u.id ASC;
+"""
+
+
+def get_rank() -> list:
+    """排行榜聚合（口径见 RANK_SQL 注释）。"""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(RANK_SQL)
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def create_problem(title, time_limit_ms, mem_limit_mb, output_limit_mb) -> int:
     """创建题目：INSERT problem → 返回新 id。"""
     conn = pymysql.connect(**DB_CONFIG)
@@ -407,7 +454,6 @@ def list_problems() -> list:
 
 def get_problem_with_testcases(pid) -> Optional[dict]:
     """根据题目 ID 查询题目及所有测试用例。
-
     None = 题目不存在（HTTP 层据此 404）。
     ★ 判题答案（expected_output）不下发：OJ 的标准答案经 API 泄露等于
       题目作废，判题侧 worker 直接读 DB 拿答案，不经本接口。
@@ -543,6 +589,15 @@ def add_testcases_endpoint(problem_id: int, req: AddTestcasesRequest):
     if n is None:
         raise HTTPException(status_code=404, detail=f"题目不存在: {problem_id}")
     return {"problem_id": problem_id, "count": n}
+
+
+@app.get("/api/rank")
+def rank_endpoint():
+    """排行榜：只读聚合，不挂 auth（与 GET 查询接口一致，查询开放）。"""
+    try:
+        return get_rank()
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
 
 
 # 静态页面（先丑后美，Wave 4 换 Vue3）
