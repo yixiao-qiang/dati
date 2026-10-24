@@ -34,6 +34,13 @@ static int64_t env_int64(const char* name, int64_t fallback) {
     if (!v || !v[0]) return fallback;
     return std::strtoll(v, nullptr, 10);
 }
+// 字符串配置同款：环境变量优先，缺省用本机默认值。
+// ★ 与 server/main.py 的 OJ_DB_HOST/OJ_DB_USER/OJ_DB_PASSWORD 同名——
+//   一套环境变量驱动两端，部署时不用记两份变量名。
+static const char* env_str(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && v[0]) ? v : fallback;
+}
 const int64_t kClaimIdleMs = env_int64("OJ_CLAIM_IDLE_MS", 600000);   // 10min 判死阈值
 const int64_t kClaimScanMs = env_int64("OJ_CLAIM_SCAN_MS", 5000);     // 每 5s 扫一次死任务
 constexpr int64_t kBlockMs = 5000;         // 无消息时阻塞等待
@@ -146,13 +153,15 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     q.ack(m.id,nullptr);
 }
 int main() {
-    // ---- 配置（学习期先用环境变量，Wave 3 统一配置中心）----
-    const char* redis_host = "127.0.0.1";
-    int redis_port = 6379;
-    const char* db_host = "127.0.0.1";
-    const char* db_name = "oj";
-    const char* judge_main = std::getenv("JUDGE_MAIN") ? std::getenv("JUDGE_MAIN") : "";
-    const char* consumer_id = std::getenv("WORKER_ID") ? std::getenv("WORKER_ID") : "w1";
+    // ---- 配置（环境变量优先，默认本机；与 server 侧变量名对齐）----
+    const char* redis_host = env_str("OJ_REDIS_HOST", "127.0.0.1");
+    const int redis_port = static_cast<int>(env_int64("OJ_REDIS_PORT", 6379));
+    const char* db_host = env_str("OJ_DB_HOST", "127.0.0.1");
+    const char* db_user = env_str("OJ_DB_USER", "oj");
+    const char* db_pass = env_str("OJ_DB_PASSWORD", "oj123456");
+    const char* db_name = env_str("OJ_DB_NAME", "oj");
+    const char* judge_main = env_str("JUDGE_MAIN", "");
+    const char* consumer_id = env_str("WORKER_ID", "w1");
 
     if (!judge_main[0]) {
         std::fprintf(stderr, "JUDGE_MAIN 未配置：export JUDGE_MAIN=.../build/judge_main\n");
@@ -164,12 +173,13 @@ int main() {
     worker::Db db;
 
     // ---- 连接（失败即退出，让 supervisor 拉起；不吞错）----
-    if (!q.connect("127.0.0.1", 6379, &err)) {
-        std::fprintf(stderr, "Redis 连接失败: %s\n", err.c_str());
+    if (!q.connect(redis_host, redis_port, &err)) {
+        std::fprintf(stderr, "Redis 连接失败(%s:%d): %s\n",
+                     redis_host, redis_port, err.c_str());
         return 1;
     }
-    if (!db.connect("127.0.0.1", "oj", "oj123456", "oj", &err)) {
-        std::fprintf(stderr, "MySQL 连接失败: %s\n", err.c_str());
+    if (!db.connect(db_host, db_user, db_pass, db_name, &err)) {
+        std::fprintf(stderr, "MySQL 连接失败(%s/%s): %s\n", db_host, db_name, err.c_str());
         return 1;
     }
     std::printf("[worker %s] 已连接 Redis(%s:%d) + MySQL(%s/%s)，JUDGE_MAIN=%s\n",
