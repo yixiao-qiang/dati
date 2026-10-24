@@ -18,6 +18,9 @@ namespace seccomp {
 // 运行期白名单：允许 glibc 启动必调 + 常见 IO/内存 syscall
 // 禁止（默认 ERRNO 拒绝，不需 explicitly 列）：
 //   fork/vfork/clone/clone3（防 fork 炸弹）
+//     ★ 代价（有意为之）：std::thread/pthread 也走 clone → 多线程程序在
+//       沙箱内直接 ENOSYS。OJ 算法题按单线程设计，用"禁线程"换"禁进程"；
+//       若未来要放开，需按 clone 的 flags 参数加条件规则（CLONE_THREAD 放行）
 //   execve（必须放行：子进程加载 seccomp 后自己要 execve 启动用户程序）
 //   socket/connect/bind/listen/accept（防网络访问）
 //   ptrace（防调试逃逸）
@@ -47,8 +50,13 @@ int apply_runtime_filter() {
         SCMP_SYS(sched_getaffinity),  // 获取 CPU 亲和性，glibc 启动可能调
 
         // === 内存管理 ===
+        // ★ mremap（审查 P2）：glibc 的 realloc 对大块（mmap 阈值以上）用
+        //   mremap 扩缩——C 程序 realloc 大数组缺了它会被 ENOSYS 拒绝，
+        //   realloc 返回 NULL，程序莫名"内存不足"。C++ 的 new/vector 不走
+        //   realloc（新块+搬移），不受影响，但判题不能只养 C++ 选手。
         SCMP_SYS(mmap),
         SCMP_SYS(munmap),
+        SCMP_SYS(mremap),
         SCMP_SYS(mprotect),
         SCMP_SYS(brk),
         SCMP_SYS(madvise),

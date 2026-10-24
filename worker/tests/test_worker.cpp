@@ -25,9 +25,11 @@
 namespace {
 
 int g_failures = 0;
+int g_checks = 0;
 
 #define CHECK(cond)                                                      \
     do {                                                                 \
+        ++g_checks;                                                      \
         if (cond) {                                                      \
             std::printf("PASS %s:%d  %s\n", __FILE__, __LINE__, #cond);  \
         } else {                                                         \
@@ -222,8 +224,7 @@ int main() {
     test_judge_outcome_default();
 
     if (g_failures == 0) {
-        std::printf("\nworker_tests: 全部通过 ✅（%d 断言，0 失败）\n", 0);
-        std::printf("（断言数未统计计数宏；失败数=0）\n");
+        std::printf("\nworker_tests: 全部通过 ✅（%d 断言，0 失败）\n", g_checks);
         return 0;
     }
     std::fprintf(stderr, "\nworker_tests: %d 个断言失败 ❌\n", g_failures);
