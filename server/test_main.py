@@ -22,12 +22,17 @@ DB_TERMINAL_STATUSES = {
 
 
 class FakeCursor:
-    """记录 execute 的 SQL，可在 outbox INSERT 时注入失败（模拟第二条写崩）。"""
+    """记录 execute 的 SQL，可在 outbox INSERT 时注入失败（模拟第二条写崩）。
+
+    results 队列供 fetchone/fetchall 依次出队（模拟 SELECT 结果），
+    不预填时 fetchone 返回 None（模拟"查无此行"）。
+    """
 
     def __init__(self, fail_on_outbox: bool = False):
         self.executed: list = []
         self.lastrowid = 42  # 模拟 AUTO_INCREMENT 返回
         self.fail_on_outbox = fail_on_outbox
+        self.results: list = []
 
     def __enter__(self):
         return self
@@ -39,6 +44,13 @@ class FakeCursor:
         self.executed.append((sql, args))
         if self.fail_on_outbox and sql.startswith("INSERT INTO outbox"):
             raise pymysql.OperationalError("simulated outbox insert failure")
+
+    def fetchone(self):
+        return self.results.pop(0) if self.results else None
+
+    def fetchall(self):
+        out, self.results = self.results, []
+        return out
 
 
 class FakeConn:
@@ -111,12 +123,34 @@ def test_create_submission_rolls_back_when_outbox_insert_fails(monkeypatch):
 # ---------- 接口校验 ----------
 
 def test_submit_returns_201_with_submission_id(client, monkeypatch):
+    monkeypatch.setattr(main, "problem_exists", lambda pid: True)
     monkeypatch.setattr(main, "create_submission", lambda code, lang, pid: 42)
 
     resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"})
 
     assert resp.status_code == 201
     assert resp.json() == {"submission_id": 42}
+
+
+def test_submit_404_when_problem_missing(client, monkeypatch):
+    """题目不存在必须入口处 404——不能等 worker 判题时落 system_error。"""
+    monkeypatch.setattr(main, "problem_exists", lambda pid: False)
+    monkeypatch.setattr(main, "create_submission",
+                        lambda code, lang, pid: (_ for _ in ()).throw(AssertionError(
+                            "题目不存在时绝不能写 submission")))
+
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp", "problem_id": 99})
+
+    assert resp.status_code == 404
+    assert "99" in resp.json()["detail"]
+
+
+def test_submit_422_when_problem_id_not_positive(client):
+    """problem_id ge=1：0/负数是参数错，pydantic 422 拒绝。"""
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp", "problem_id": 0})
+    assert resp.status_code == 422
 
 
 def test_submit_rejects_code_over_64kb(client):
@@ -239,13 +273,30 @@ def test_problem_detail_200_with_testcases(client, monkeypatch):
     detail = {
         "id": 1, "title": "A+B", "time_limit_ms": 1000,
         "mem_limit_mb": 256, "output_limit_mb": 64,
-        "testcases": [{"id": 1, "ordinal": 0, "input": "1 2",
-                       "expected_output": "3", "score": 1}],
+        "testcases": [{"id": 1, "ordinal": 0, "input": "1 2", "score": 1}],
     }
     monkeypatch.setattr(main, "get_problem_with_testcases", lambda pid: detail)
     resp = client.get("/api/problems/1")
     assert resp.status_code == 200
     assert len(resp.json()["testcases"]) == 1, "详情必须带用例（判题逐用例跑的输入来源）"
+    assert "expected_output" not in resp.json()["testcases"][0], \
+        "详情不得下发标准答案（防泄题）——判题侧 worker 直读 DB"
+
+
+def test_get_problem_with_testcases_sql_excludes_expected_output(fake_conn):
+    """SQL 层面就不查答案列：结构上杜绝泄露，而不是靠返回后过滤。"""
+    fake_conn.cursor_.results = [
+        {"id": 1, "title": "A+B", "time_limit_ms": 1000,
+         "mem_limit_mb": 256, "output_limit_mb": 64},
+        [{"id": 5, "ordinal": 0, "input": "1 2", "score": 1}],
+    ]
+
+    row = main.get_problem_with_testcases(1)
+
+    tc_sql = [sql for sql, _ in fake_conn.cursor_.executed
+              if "FROM testcase" in sql][0]
+    assert "expected_output" not in tc_sql, "testcase 的 SELECT 不得包含答案列"
+    assert "expected_output" not in row["testcases"][0]
 
 
 def test_problem_detail_404_when_not_exists(client, monkeypatch):
@@ -275,6 +326,36 @@ def test_add_testcases_404_when_problem_missing(client, monkeypatch):
 def test_add_testcases_400_empty_list(client):
     resp = client.post("/api/problems/1/testcases", json={"testcases": []})
     assert resp.status_code == 400, "空用例数组没有业务意义，400 拒绝"
+
+
+def test_add_testcases_400_oversize_input(client):
+    """单条用例超 256KB 必须 400——DB 列是 MEDIUMTEXT，不设限会被撑爆。"""
+    big = "x" * (main.MAX_CASE_BYTES + 1)
+    resp = client.post(
+        "/api/problems/1/testcases",
+        json={"testcases": [{"input": big, "expected_output": "1"}]},
+    )
+    assert resp.status_code == 400
+    assert "256KB" in resp.json()["detail"]
+
+
+def test_add_testcases_400_too_many(client):
+    resp = client.post(
+        "/api/problems/1/testcases",
+        json={"testcases": [{"input": "1", "expected_output": "1"}]
+              * (main.MAX_TESTCASES + 1)},
+    )
+    assert resp.status_code == 400
+    assert "100" in resp.json()["detail"]
+
+
+def test_add_testcases_400_bad_score(client):
+    resp = client.post(
+        "/api/problems/1/testcases",
+        json={"testcases": [{"input": "1", "expected_output": "1", "score": 0}]},
+    )
+    assert resp.status_code == 400
+    assert "score" in resp.json()["detail"]
 
 
 # ================= Wave 4 收尾 · K6 词汇表契约测试 =================

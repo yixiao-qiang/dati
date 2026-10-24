@@ -35,12 +35,17 @@ app = FastAPI(title="OJ 判题 server（Wave 3 异步判题）")
 # 语言白名单 + 代码上限（与 init.sql 的 language 列、MEDIUMTEXT 对齐）
 ALLOWED_LANGS = {"cpp", "c"}
 MAX_CODE_BYTES = 64 * 1024  # 64KB
+# 用例输入/期望输出上限与批次上限：DB 列是 MEDIUMTEXT(16MB)，接口若不设限，
+# 单条超大用例会撑爆存储与判题管道（FastAPI 对请求体大小默认无限制）
+MAX_CASE_BYTES = 256 * 1024   # 单条 input/expected_output ≤ 256KB
+MAX_TESTCASES = 100           # 单次挂载 ≤ 100 条
 
 
 class SubmitRequest(BaseModel):
     code: str
     language: str = "cpp"
-    problem_id: int = 1  # 关联题目（限额从 problem 表读；学习期默认题 1）
+    # 关联题目（限额从 problem 表读）。ge=1 挡 0/负数——题目 id 从 1 起
+    problem_id: int = Field(default=1, ge=1)
 
 class CreateProblemRequest(BaseModel):
     title: str
@@ -86,15 +91,36 @@ def create_submission(code: str, language: str, problem_id: int = 1) -> int:
         conn.close()
 
 
+def problem_exists(pid: int) -> bool:
+    """题目存在性检查（提交接口用）。
+
+    为什么提交前必须查：submission.problem_id 无外键约束，不查会静默插入
+    孤儿提交，直到 worker 判题时才发现题目没有用例，落一个用户看不懂的
+    system_error——错误应该在入口处以 404 拒绝，而不是判题末端报系统错误。
+    （检查与插入之间存在竞态窗口：题目恰好被删仍可能入库——学习期接受，
+    生产用外键约束兜底。）
+    """
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM problem WHERE id=%s", (pid,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 @app.post("/api/submit", status_code=201)
 def submit(req: SubmitRequest):
-    # 校验前置：参数错是用户的错（400），DB 错是环境的错（500）
+    # 校验前置：参数错是用户的错（400），题目不存在是凭据错（404），
+    # DB 错是环境的错（500）——三者必须分开（面试点）
     if len(req.code.encode("utf-8")) > MAX_CODE_BYTES:
         raise HTTPException(status_code=400, detail="代码超过 64KB")
     if req.language not in ALLOWED_LANGS:
         raise HTTPException(status_code=400, detail=f"不支持的语言: {req.language}")
 
     try:
+        if not problem_exists(req.problem_id):
+            raise HTTPException(status_code=404, detail=f"题目不存在: {req.problem_id}")
         sid = create_submission(req.code, req.language, req.problem_id)
     except pymysql.MySQLError:
         raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
@@ -155,6 +181,8 @@ def get_problem_with_testcases(pid) -> Optional[dict]:
     """根据题目 ID 查询题目及所有测试用例。
 
     None = 题目不存在（HTTP 层据此 404）。
+    ★ 判题答案（expected_output）不下发：OJ 的标准答案经 API 泄露等于
+      题目作废，判题侧 worker 直接读 DB 拿答案，不经本接口。
     """
     conn = pymysql.connect(**DB_CONFIG)
     try:
@@ -169,7 +197,7 @@ def get_problem_with_testcases(pid) -> Optional[dict]:
                 return None
             # 用例按业务序（ordinal）排：判题逐用例跑，顺序就是执行顺序
             cur.execute(
-                "SELECT id, ordinal, input, expected_output, score "
+                "SELECT id, ordinal, input, score "
                 "FROM testcase WHERE problem_id=%s ORDER BY ordinal",
                 (pid,),
             )
@@ -268,6 +296,18 @@ def problem_detail(problem_id: int):
 def add_testcases_endpoint(problem_id: int, req: AddTestcasesRequest):
     if not req.testcases:
         raise HTTPException(status_code=400, detail="用例列表不能为空")
+    if len(req.testcases) > MAX_TESTCASES:
+        raise HTTPException(
+            status_code=400, detail=f"单次最多挂载 {MAX_TESTCASES} 条用例")
+    for i, tc in enumerate(req.testcases):
+        if (len(tc.input.encode("utf-8")) > MAX_CASE_BYTES
+                or len(tc.expected_output.encode("utf-8")) > MAX_CASE_BYTES):
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {i} 条用例的 input/expected_output 超过 256KB 上限")
+        if not (1 <= tc.score <= 100):
+            raise HTTPException(
+                status_code=400, detail=f"第 {i} 条用例的 score 需在 1-100 之间")
     try:
         n = add_testcases(problem_id, req.testcases)
     except pymysql.MySQLError:
