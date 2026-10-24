@@ -218,6 +218,30 @@ void test_judge_outcome_default() {
     CHECK(out.total_cases == 0);
 }
 
+void test_runner_status_vocabulary_contract() {
+    // Wave 5 台阶 1 契约：runner 输出的每个状态，parse_status 必须给出
+    // 明确映射（不落 default SystemError）。唯一例外是 INTERNAL_ERROR
+    // 本身——它映射 SystemError 是合法行为（runner 内部错误=系统错误）。
+    using worker::JudgeStatus;
+    for (const char* s : worker::kRunnerStatusVocabulary) {
+        JudgeStatus st = worker::parse_status(s);
+        if (std::string(s) == "INTERNAL_ERROR") {
+            CHECK(st == JudgeStatus::SystemError);
+        } else {
+            CHECK(st != JudgeStatus::SystemError);
+        }
+    }
+    // 关键映射钉死（与 1ae0449 修复一致）：
+    // runner 输出全名，parse_status 认短码又认全名（历史兼容）
+    CHECK(worker::parse_status("OK") == JudgeStatus::Accepted);
+    CHECK(worker::parse_status("NONZERO_EXIT") == JudgeStatus::RuntimeError);
+    CHECK(worker::parse_status("TLE") == JudgeStatus::TimeLimit);
+    CHECK(worker::parse_status("MLE") == JudgeStatus::MemoryLimit);
+    CHECK(worker::parse_status("RUNTIME_ERROR") == JudgeStatus::RuntimeError);
+    CHECK(worker::parse_status("OLE") == JudgeStatus::WrongAnswer);
+    CHECK(worker::parse_status("INTERNAL_ERROR") == JudgeStatus::SystemError);
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +252,7 @@ int main() {
     test_json_fields();
     test_output_matches();
     test_judge_outcome_default();
+    test_runner_status_vocabulary_contract();
 
     if (g_failures == 0) {
         std::printf("\nworker_tests: 全部通过 ✅（%d 断言，0 失败）\n", g_checks);

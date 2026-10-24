@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS submission (
     KEY idx_status (status),                     -- 条件更新走索引，不扫全表
     KEY idx_problem (problem_id),
     passed_cases INT NOT NULL DEFAULT 0,      -- 已通过的测试点数
-    total_cases INT NOT NULL DEFAULT 0,       -- 总测试点数
+    total_cases INT NOT NULL DEFAULT 0       -- 总测试点数
 ) ENGINE=InnoDB;
 
 -- 专用账号：oj / oj123456（学习期口令，生产必须换强口令 + 最小权限）
@@ -80,4 +80,11 @@ CREATE TABLE IF NOT EXISTS testcase(
     ordinal INT NOT NULL DEFAULT 0,
     score INT NOT NULL DEFAULT 1,
     KEY idx_problem (problem_id,ordinal)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS users(
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(32) NOT NULL UNIQUE,
+    password_hash VARCHAR(128) NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;

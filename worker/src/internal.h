@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "db.h"  // JudgeStatus 枚举 + judge_status_to_string 声明
@@ -36,6 +37,19 @@ std::string escape_sql(void* conn, const std::string& raw);
 JudgeStatus parse_status(const std::string& s);
 
 bool output_matches(const std::string& expected, const std::string& actual);
+
+// ★ runner → parse_status 词汇表契约（Wave 5 台阶 1 契约测试用）。
+// 权威源：sandbox/src/runner.cpp:134 status_to_string——runner 输出的全部
+// 状态。parse_status 必须能认这套全集，否则 runner 新状态会落 default
+// → SystemError（1ae0449 教训：曾只认短码 RE，RUNTIME_ERROR 误判 system_error）。
+// 加新状态必须三处同步：runner status_to_string + 本数组 + parse_status。
+// 为什么 inline + constexpr：头文件变量必须有内联定义，多编译单元包含
+// 才不触发 ODR 重复定义（C++17 inline 变量规则，面试可能问）。
+inline const char* const kRunnerStatusVocabulary[] = {
+    "OK", "NONZERO_EXIT", "TLE", "MLE",
+    "RUNTIME_ERROR", "OLE", "INTERNAL_ERROR",
+};
+inline constexpr size_t kRunnerStatusVocabularySize = 7;
 
 // 扁平 JSON 对象字段提取（judge_main 输出的解析，顺序解析、转义正确）。
 // json_field_str 返回已 unescape 的字符串值；json_field_num 返回数字的

@@ -428,3 +428,202 @@ def test_frontend_status_text_covers_all_statuses():
     assert not missing, (
         f"前端 STATUS_TEXT 缺少状态 {sorted(missing)}——这些状态会渲染成 undefined。"
     )
+
+
+# ================= Wave 5 台阶 1 · 认证（users / scrypt / Redis session） =================
+
+class FakeRedis:
+    """mock main.REDIS：记录 setex/delete/get 调用，不碰真 Redis。
+
+    与 FakeConn 同理：测试只验证 server 对 Redis 的"行为契约"
+    （key 格式 / TTL / 删除幂等），不验证 Redis 本身。
+    """
+
+    def __init__(self):
+        self.store = {}
+        self.calls = []
+
+    def setex(self, name, time, value):
+        self.calls.append(("setex", name, time, value))
+        self.store[name] = value
+
+    def delete(self, name):
+        self.calls.append(("delete", name))
+        self.store.pop(name, None)
+
+    def get(self, name):
+        return self.store.get(name)
+
+
+@pytest.fixture
+def fake_redis():
+    return FakeRedis()
+
+
+# 供 login 测试用的"已注册用户"：模块导入时真跑一次 scrypt（~70ms，可接受）
+USER_ROW = {"id": 7, "username": "alice",
+            "password_hash": main.hash_password("secret123")}
+
+
+# ---------- 密码哈希（纯函数，不碰库） ----------
+
+def test_hash_password_self_describing_format():
+    """scrypt 格式必须自包含：重建哈希所需参数（N/R/P/盐）全在串里。
+
+    为什么是 6 段：scrypt$N$R$P$<salt_b64>$<hash_b64>——没有第 6 段哈希，
+    verify 就无从比对；没有前 4 段参数，verify 就无从重算。
+    """
+    h = main.hash_password("secret123")
+    parts = h.split("$")
+    assert len(parts) == 6, "scrypt$N$R$P$salt$hash 共 6 段"
+    assert parts[0] == "scrypt"
+    assert parts[1] == str(main.SCRYPT_N)
+    assert parts[2] == str(main.SCRYPT_R)
+    assert parts[3] == str(main.SCRYPT_P)
+    # 盐和哈希是合法 base64
+    import base64
+    assert base64.b64decode(parts[4]) and base64.b64decode(parts[5])
+
+
+def test_hash_password_salt_randomizes_output():
+    h1 = main.hash_password("secret123")
+    h2 = main.hash_password("secret123")
+    assert h1 != h2, "盐随机：同密码两次哈希必须不同（否则相同密码可被识别）"
+    assert main.verify_password("secret123", h1)
+    assert main.verify_password("secret123", h2)
+
+
+def test_verify_password_rejects_wrong_password():
+    h = main.hash_password("secret123")
+    assert not main.verify_password("wrong456", h), "错密码必须 False"
+
+
+def test_verify_password_rejects_garbage():
+    """脏数据（格式非法）必须返回 False 而不是抛异常——login 无需区分
+    "密码错"和"库被写坏"，两种都按 401 处理。"""
+    assert not main.verify_password("secret123", "not-a-hash")
+    assert not main.verify_password("secret123", "")
+    assert not main.verify_password("secret123", "md5$abc")
+    assert not main.verify_password("secret123", "scrypt$16384$8$1$!!bad$!!bad")
+
+
+# ---------- 注册 ----------
+
+def test_register_201(client, monkeypatch):
+    monkeypatch.setattr(main, "create_user", lambda u, h: 1)
+    resp = client.post("/api/register",
+                       json={"username": "alice", "password": "secret123"})
+    assert resp.status_code == 201
+    assert resp.json() == {"username": "alice"}
+
+
+def test_register_409_duplicate_username(client, monkeypatch):
+    """重复用户名是资源冲突（409），不是请求格式错（400）——语义分层。"""
+    def dup(u, h):
+        raise pymysql.IntegrityError("Duplicate entry 'alice' for key 'username'")
+
+    monkeypatch.setattr(main, "create_user", dup)
+    resp = client.post("/api/register",
+                       json={"username": "alice", "password": "secret123"})
+    assert resp.status_code == 409
+    assert "alice" in resp.json()["detail"]
+
+
+def test_register_400_invalid_username(client):
+    """用户名白名单 ^[a-zA-Z0-9_]{3,20}$：太短/非法字符/超长全拒。"""
+    for bad in ["ab", "a b!", "中文名", "toolongtoolongtoolongname1"]:
+        resp = client.post("/api/register",
+                           json={"username": bad, "password": "secret123"})
+        assert resp.status_code == 400, f"用户名 {bad!r} 应被 400 拒绝"
+
+
+def test_register_400_short_password(client):
+    resp = client.post("/api/register",
+                       json={"username": "alice", "password": "1234567"})
+    assert resp.status_code == 400, "密码 <8 位是参数错，400"
+
+
+def test_register_500_when_db_unavailable(client, monkeypatch):
+    def boom(u, h):
+        raise pymysql.OperationalError("db is down")
+
+    monkeypatch.setattr(main, "create_user", boom)
+    resp = client.post("/api/register",
+                       json={"username": "alice", "password": "secret123"})
+    assert resp.status_code == 500
+
+
+# ---------- 登录 ----------
+
+def test_login_200_with_token(client, monkeypatch, fake_redis):
+    monkeypatch.setattr(main, "get_user_by_name", lambda name: USER_ROW)
+    monkeypatch.setattr(main, "REDIS", fake_redis)
+
+    resp = client.post("/api/login",
+                       json={"username": "alice", "password": "secret123"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["username"] == "alice"
+    assert body["token"], "登录必须返回 token"
+    # Redis 写入契约：key=session:{token}、TTL=24h、value=user_id 字符串
+    assert ("setex", "session:" + body["token"], main.SESSION_TTL, "7") \
+        in fake_redis.calls
+
+
+def test_login_401_wrong_password(client, monkeypatch):
+    monkeypatch.setattr(main, "get_user_by_name", lambda name: USER_ROW)
+    resp = client.post("/api/login",
+                       json={"username": "alice", "password": "wrong456"})
+    assert resp.status_code == 401
+
+
+def test_login_401_same_response_for_unknown_user_and_wrong_password(client, monkeypatch):
+    """用户不存在 / 密码错，两条 401 响应必须逐字节一致——防用户枚举。
+
+    若两者 detail 不同或状态码不同，攻击者注册一个用户名再请求登录，
+    靠响应差异即可探测"该用户名是否存在"。"""
+    monkeypatch.setattr(main, "get_user_by_name", lambda name: None)
+    r_unknown = client.post("/api/login",
+                            json={"username": "nobody", "password": "secret123"})
+    monkeypatch.setattr(main, "get_user_by_name", lambda name: USER_ROW)
+    r_wrong = client.post("/api/login",
+                          json={"username": "alice", "password": "wrong456"})
+    assert r_unknown.status_code == r_wrong.status_code == 401
+    assert r_unknown.json() == r_wrong.json(), \
+        "两条 401 响应必须一致，否则泄露用户是否存在"
+
+
+def test_login_400_invalid_format(client):
+    """登录也做格式校验（与注册同规格）——格式错是参数错，400。"""
+    resp = client.post("/api/login",
+                       json={"username": "ab", "password": "secret123"})
+    assert resp.status_code == 400
+
+
+# ---------- 登出 ----------
+
+def test_logout_200_deletes_key(client, monkeypatch, fake_redis):
+    fake_redis.store["session:abc"] = "7"
+    monkeypatch.setattr(main, "REDIS", fake_redis)
+
+    resp = client.post("/api/logout",
+                       headers={"Authorization": "Bearer abc"})
+
+    assert resp.status_code == 200
+    assert ("delete", "session:abc") in fake_redis.calls
+    assert "session:abc" not in fake_redis.store, "session key 必须被删掉"
+
+
+def test_logout_200_idempotent_missing_key(client, monkeypatch, fake_redis):
+    """token 不存在/已过期：DEL 0 行也应 200——用户登出两次不该报错。"""
+    monkeypatch.setattr(main, "REDIS", fake_redis)
+    resp = client.post("/api/logout",
+                       headers={"Authorization": "Bearer ghost"})
+    assert resp.status_code == 200
+    assert ("delete", "session:ghost") in fake_redis.calls
+
+
+def test_logout_401_missing_header(client):
+    resp = client.post("/api/logout")
+    assert resp.status_code == 401, "无 Authorization 头 = 未登录，401"

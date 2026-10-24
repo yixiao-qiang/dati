@@ -15,8 +15,15 @@ OJ 判题 server · Wave 3 台阶 1：提交接口登记化（异步判题闭环
 import os
 from typing import List, Optional
 
+import hashlib
+import hmac
+import base64
+import secrets
+import re
+import redis
+
 import pymysql
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +36,27 @@ DB_CONFIG = {
     "autocommit": False,  # 必须手动关：两张 INSERT 要落在同一个事务里
     "cursorclass": pymysql.cursors.DictCursor,
 }
+
+# ============ 认证（Wave 5 台阶 1）============
+# scrypt 慢哈希参数：n=2**14 把单次验证拉到 ~70ms，爆破成本 ×10^6
+SCRYPT_N = 2 ** 14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+
+SESSION_TTL = 24 * 3600        # session 24h 过期——Redis TTL 天然到期删除
+SESSION_PREFIX = "session:"    # key 命名空间，防止与其他 key 撞名
+
+# session 存 Redis 而不是 DB 表（为什么，面试点）：
+#   TTL 天然过期（不用写清理任务）/ DEL 原子读删（logout 幂等）/ 多实例共享
+REDIS = redis.Redis(
+    host=os.environ.get("OJ_REDIS_HOST", "127.0.0.1"),
+    port=6379, db=0,
+    decode_responses=True,     # 返回值直接是 str，省去每处 bytes.decode()
+)
+
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")  # 白名单：防奇怪字符进排行榜/注册
+MIN_PASSWORD_LEN = 8
 
 app = FastAPI(title="OJ 判题 server（Wave 3 异步判题）")
 
@@ -60,6 +88,90 @@ class TestcaseItem(BaseModel):
 
 class AddTestcasesRequest(BaseModel):
     testcases: List[TestcaseItem]
+
+def hash_password(password: str) -> str:
+    """scrypt 慢哈希，返回自描述格式：盐和参数全部内嵌在串里。
+
+    为什么自己定格式（面试点）：bcrypt 把盐内嵌在哈希串（$2b$...），
+    scrypt 不内嵌——盐、n/r/p 不存进串里，verify 时就无从重建。
+    存 scrypt$16384$8$1$<salt_b64>$<hash_b64>：重建哈希所需参数全在串里。
+    """
+    salt = os.urandom(16)   # 每次随机 → 同一个密码两次哈希结果不同
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=SCRYPT_DKLEN,
+    )
+    return "scrypt${}${}${}${}${}".format(
+        SCRYPT_N,
+        SCRYPT_R,
+        SCRYPT_P,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """解析自描述格式 → 重算哈希 → 常数时间比较。
+
+    为什么 try/except 包全函数：格式非法（段数不对/解码失败）是脏数据，
+    返回 False 而不是抛异常——login 不需要区分"密码错"和"库被写坏"。
+    为什么 hmac.compare_digest：普通 == 按字节短路返回，攻击者可以按
+    耗时差异猜出哈希前缀——常数时间比较没有这个侧信道（面试点）。
+    """
+    try:
+        scheme, n, r, p, salt_b64, hash_b64 = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        actual = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def get_user_by_name(username: str) -> Optional[dict]:
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash FROM users WHERE username=%s",
+                (username,),
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+def create_user(username: str, password_hash: str) -> int:
+    """INSERT users，返回新 id。唯一键冲突（IntegrityError）由调用方转 409。
+
+    参数名必须是 password_hash 不是 password：这里存的是哈希串，
+    叫 password 会误导读代码的人以为存了明文（安全语义问题）。
+    """
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+                (username, password_hash),
+            )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def create_submission(code: str, language: str, problem_id: int = 1) -> int:
     """一个事务写 submission + outbox，返回 submission_id。
@@ -108,6 +220,46 @@ def problem_exists(pid: int) -> bool:
     finally:
         conn.close()
 
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/register", status_code=201)
+def register(req: AuthRequest):
+    if not USERNAME_RE.match(req.username):
+        raise HTTPException(status_code=400, detail="用户名需 3-20 位字母/数字/下划线")
+    if len(req.password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail="密码需 8 位以上")
+    try:
+        create_user(req.username, hash_password(req.password))
+    except pymysql.IntegrityError:
+        raise HTTPException(status_code=409, detail=f"用户名已存在: {req.username}")
+    except pymysql.MySQLError:
+        raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
+    return {"username": req.username}
+
+@app.post("/api/login")
+def login(req: AuthRequest):
+    # 格式校验同样做（400）；凭据错统一 401——不泄露"用户名是否存在"
+    if not USERNAME_RE.match(req.username) or len(req.password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail="用户名或密码格式错误")
+    user = get_user_by_name(req.username)
+    if user is None or not verify_password(req.password, user["password_hash"]):
+        # 用户不存在 / 密码错共用同一条 401 同文案：响应逐字节一致，
+        # 攻击者无法靠"哪个先返回/文案差异"探测用户是否注册（面试点）
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = secrets.token_hex(32)   # 256 bit 熵，不可预测
+    REDIS.setex(f"{SESSION_PREFIX}{token}", SESSION_TTL, str(user["id"]))
+    return {"token": token, "username": req.username}
+
+@app.post("/api/logout")
+def logout(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+    token = authorization[len("Bearer "):].strip()
+    REDIS.delete(f"{SESSION_PREFIX}{token}")
+    return {"ok": True}
 
 @app.post("/api/submit", status_code=201)
 def submit(req: SubmitRequest):
