@@ -228,9 +228,18 @@ JudgeResult run(const SandboxConfig& config) {
     close(sync_pipe[1]);
 
     // === 8. 写 stdin，写完关写端（子进程 read 得到 EOF）===
+    // ★ 写入预算（审查 P1-2）：管道容量只有 64KB，若输入更大且用户程序
+    //   不读 stdin（如 while(1);），写端永远 EAGAIN——这个循环没有预算就
+    //   会死转，后面的超时/OLE 主循环永远执行不到；外层 run_capture 超时
+    //   SIGKILL 整个 judge_main 后，沙箱里的用户程序成孤儿进程（sleep 型
+    //   不吃 CPU，RLIMIT_CPU 兜底杀不掉）+ cgroup 无人清理，每触发一次
+    //   泄漏一份。预算耗尽就放弃剩余写入并关写端：不读 stdin 的程序本来
+    //   就不依赖这些输入，正常慢读的程序（判题限额秒级）5s 绰绰有余。
     int flags = fcntl(in_pipe[1], F_GETFL);
     fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
     if (!config.input.empty()) {
+        const auto stdin_deadline = std::chrono::steady_clock::now()
+                                   + std::chrono::seconds(5);
         size_t written = 0;
         size_t total = config.input.size();
         while(written < total){
@@ -238,10 +247,16 @@ JudgeResult run(const SandboxConfig& config) {
             if(n > 0){
                 written += n;
             }else if(n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)){
-                //管道满了，等待1ms后再写
+                //管道满了：预算内等 1ms 重试；预算耗尽放弃（见上注释）
+                if (std::chrono::steady_clock::now() >= stdin_deadline) {
+                    std::fprintf(stderr,
+                                 "沙箱：stdin 写入 5s 预算耗尽（程序不读输入），"
+                                 "放弃剩余 %zu 字节\n", total - written);
+                    break;
+                }
                 usleep(1000);
             }else {
-                break;
+                break;  // EPIPE 等：子进程已退出，写无可写
             }
         }
     }
@@ -334,6 +349,14 @@ JudgeResult run(const SandboxConfig& config) {
     };
     drain_capped(out_pipe[0], stdout_buf);
     drain_capped(err_pipe[0], stderr_buf);
+
+    // ★ drain 后补一次 OLE 终判（审查 P1-6）：OLE 判定原本只在主循环里做，
+    //   程序在 buffer 逼近限额时退出、剩余管道残留（≤128KB）由 drain 补读
+    //   顶过限额的窄窗口里，会漏判成正常退出。此处补判把窗口关死。
+    if (!ole_triggered &&
+        stdout_buf.size() + stderr_buf.size() >= output_limit_bytes) {
+        ole_triggered = true;
+    }
 
     // === 11. 读 cgroup 计量 ===
     result.cpu_time_us = cgroup::read_cpu_usage(cg_path);
