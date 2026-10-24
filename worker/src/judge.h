@@ -8,6 +8,8 @@
 // 判题流程（两步，与垂直切片 server 相同）：
 //   1. 编译（沙箱外）：源码 -> g++ -O2 -> 二进制（/tmp/oj_<uuid>）
 //   2. 运行（沙箱内）：judge_main <bin> <time_ms> <mem_mb> <output_mb> -> 一行 JSON
+//      （用例输入经 judge_main 的 stdin 传入——argv 单参数上限 128KB，大输入
+//        会 E2BIG，见 judge.cpp run_capture 的 child_input 注释）
 
 #pragma once
 

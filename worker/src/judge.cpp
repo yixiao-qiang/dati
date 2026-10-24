@@ -150,14 +150,32 @@ std::string unescape(const std::string& s) {
 // heartbeat（D3）：判题处理期间每 kHeartbeatIntervalMs 调一次的可选回调。
 //   为什么需要：run_capture 阻塞时主循环没有机会 reset_idle，长任务消息的
 //   idle 会涨过判死阈值被 XAUTOCLAIM 误判死；回调在轮询循环里周期续命。
+// child_input（P1-3）：非空时经管道写进子进程 stdin（写完关写端给 EOF）。
+//   为什么不用 argv 传用例输入：Linux 单参数上限 128KB（MAX_ARG_STRLEN），
+//   大输入用例 execve 直接 E2BIG → judge_main 没跑 → 落 system_error；
+//   stdin 没有 128KB 限制，还能原样传递 NUL 等字节（argv 是 C 字符串会截断）。
+//   写入带 10s 预算：judge_main 启动即读 stdin，正常毫秒级完成；不读 = 卡死，
+//   预算耗尽放弃，由外层 timeout 兜底（与 sandbox 的 stdin 预算同一纪律）。
 int run_capture(const std::vector<std::string>& argv, int timeout_ms,
                 bool capture_stderr,
                 std::string* output, int* status_out, std::string* err,
-                const std::function<void()>& heartbeat = {}) {
-    // ① 管道：子进程 stdout → 父进程
+                const std::function<void()>& heartbeat = {},
+                const std::string* child_input = nullptr) {
+    // 忽略 SIGPIPE：child_input 写入时子进程可能已退出（EPIPE），
+    // 默认 SIGPIPE 会直接杀死 worker 整个进程——判题机不能被一个死子进程带走
+    signal(SIGPIPE, SIG_IGN);
+
+    // ① 管道：子进程 stdout → 父进程（child_input 非空时再加一条 stdin 管道）
     int pipefd[2];
+    int in_pipefd[2] = {-1, -1};
     if (pipe(pipefd) != 0) {
         if (err) *err = std::string("pipe 失败: ") + std::strerror(errno);
+        return -1;
+    }
+    if (child_input && pipe(in_pipefd) != 0) {
+        if (err) *err = std::string("stdin pipe 失败: ") + std::strerror(errno);
+        close(pipefd[0]);
+        close(pipefd[1]);
         return -1;
     }
 
@@ -167,6 +185,7 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
         if (err) *err = std::string("fork 失败: ") + std::strerror(errno);
         close(pipefd[0]);
         close(pipefd[1]);
+        if (in_pipefd[0] >= 0) { close(in_pipefd[0]); close(in_pipefd[1]); }
         return -1;
     }
 
@@ -174,6 +193,11 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
         // 子进程：stdout 重定向到管道写端，然后 exec 替换
         dup2(pipefd[1], STDOUT_FILENO);
         if (capture_stderr) dup2(pipefd[1], STDERR_FILENO);  // 合并 stderr
+        if (in_pipefd[0] >= 0) {
+            dup2(in_pipefd[0], STDIN_FILENO);   // stdin ← 管道读端
+            close(in_pipefd[0]);
+            close(in_pipefd[1]);
+        }
         close(pipefd[0]);
         close(pipefd[1]);
         // vector<string> → char* 数组（execvp 需要，末尾 nullptr）
@@ -202,6 +226,31 @@ int run_capture(const std::vector<std::string>& argv, int timeout_ms,
     int flags = fcntl(pipefd[0], F_GETFL, 0);
     fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
     close(pipefd[1]);  // ★ 必须关写端，否则 read 永远等不到 EOF
+
+    // ③' 写子进程 stdin（child_input 非空时）：非阻塞 + 10s 预算，写完关写端
+    //    给 EOF——judge_main 读到 EOF 才开始判题。EPIPE（子进程已退出）安全
+    //    跳出（SIGPIPE 已在函数入口忽略）。
+    if (in_pipefd[0] >= 0) {
+        close(in_pipefd[0]);
+        const int wflags = fcntl(in_pipefd[1], F_GETFL, 0);
+        fcntl(in_pipefd[1], F_SETFL, wflags | O_NONBLOCK);
+        const int64_t write_deadline = now_ms() + 10000;
+        size_t written = 0;
+        while (written < child_input->size()) {
+            ssize_t n = write(in_pipefd[1],
+                              child_input->data() + written,
+                              child_input->size() - written);
+            if (n > 0) {
+                written += static_cast<size_t>(n);
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (now_ms() >= write_deadline) break;  // 子进程不读 stdin，放弃
+                usleep(1000);
+            } else {
+                break;  // EPIPE 等：子进程已退出
+            }
+        }
+        close(in_pipefd[1]);  // EOF：judge_main 见到它才开始跑沙箱
+    }
 
     std::string out;
     char buf[4096];
@@ -416,15 +465,17 @@ bool judge_code(const std::string& code, const std::string& language,
     for (const auto& tc : testcases) {
         // judge_main 需要 root：worker 不持 root（权限隔离），非 root 时 sudo -n 前缀
         // -n = non-interactive，不弹密码（worker 无交互，弹密码会挂死）
+        // ★ 用例输入经 stdin 传（run_capture 的 child_input），不进 argv：
+        //   argv 单参数上限 128KB，大输入用例 execve 会 E2BIG（审查 P1-3）
         std::vector<std::string> argv;
         if (geteuid() != 0) {
             argv = {"sudo", "-n", judge_main, bin,
                     std::to_string(time_ms), std::to_string(mem_mb),
-                    std::to_string(output_mb), tc.input};
+                    std::to_string(output_mb)};
         } else {
             argv = {judge_main, bin,
                     std::to_string(time_ms), std::to_string(mem_mb),
-                    std::to_string(output_mb), tc.input};
+                    std::to_string(output_mb)};
         }
 
         std::string json;
@@ -433,7 +484,7 @@ bool judge_code(const std::string& code, const std::string& language,
         // capture_stderr=false：JSON 只从 stdout 读，judge_main 自身 stderr 直接上日志
         // heartbeat 每个用例都传：循环里多个 run_capture，每个都要续命（D3）
         const int rc = run_capture(argv, time_ms + 5000, false, &json, &status, err,
-                                   heartbeat);
+                                   heartbeat, &tc.input);
 
         if (rc == -1) {   // fork/pipe 故障（内部错误）
             unlink(bin.c_str());

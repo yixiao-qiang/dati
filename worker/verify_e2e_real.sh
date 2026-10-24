@@ -9,7 +9,7 @@ cat > /tmp/hello.cpp <<'EOF'
 int main(){ printf("Hello, World!\n"); return 0; }
 EOF
 g++ -O2 -static -o /tmp/hello /tmp/hello.cpp
-sudo ./sandbox/tests/smoke/build/judge_main /tmp/hello 1000 256 64
+sudo ./sandbox/tests/smoke/build/judge_main /tmp/hello 1000 256 64 < /dev/null
 echo ""
 
 echo "========== 2. 插入真实代码提交 =========="

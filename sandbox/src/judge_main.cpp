@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>   // read（stdin 全量读取）
 
 // 把字符串转义成合法的 JSON 字符串内容
 // 必须处理：\ " \n \r \t（否则用户程序输出含引号/换行时 JSON 会坏）
@@ -30,10 +31,27 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
+// 读尽 stdin（二进制安全：按长度 append，含 NUL 字节也原样进 config.input）
+// ★ 为什么输入走 stdin 而不是 argv（审查 P1-3）：argv 单参数上限 128KB
+//   （MAX_ARG_STRLEN），大输入用例 execve 直接 E2BIG，judge_main 根本起不来；
+//   且 argv 是 C 字符串，NUL 字节会被截断。stdin 两个限制都没有。
+static std::string read_all_stdin() {
+    std::string data;
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
+        data.append(buf, static_cast<size_t>(n));
+    }
+    return data;
+}
+
 int main(int argc, char* argv[]) {
     // 参数：argv[1]=二进制路径 argv[2]=时间ms argv[3]=内存MB argv[4]=输出MB
-    if (argc != 6) {
-        std::fprintf(stderr, "用法: %s <binary> <time_ms> <mem_mb> <output_mb> <input>\n", argv[0]);
+    // 用例输入从 stdin 读（读尽到 EOF）——见 read_all_stdin 注释
+    if (argc != 5) {
+        std::fprintf(stderr,
+                     "用法: %s <binary> <time_ms> <mem_mb> <output_mb> （用例输入经 stdin 传入）\n",
+                     argv[0]);
         return 1;
     }
 
@@ -42,7 +60,7 @@ int main(int argc, char* argv[]) {
     cfg.time_limit_ms = std::atoi(argv[2]);
     cfg.memory_limit_mb = std::atoi(argv[3]);
     cfg.output_limit_mb = std::atoi(argv[4]);
-    cfg.input = argv[5];
+    cfg.input = read_all_stdin();
     cfg.pids_limit = 64;
     cfg.use_rootfs = true;
 
