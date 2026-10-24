@@ -13,12 +13,30 @@ from fastapi.testclient import TestClient
 import main
 from main import MAX_CODE_BYTES, SubmitRequest, create_submission
 
-# K6 契约测试用：DB 状态机的全部终态（权威来源 = worker/src/db.cpp finish()
-# 白名单 + rescue 的 dead；前端 TERMINAL/STATUS_TEXT 必须与它对齐）
-DB_TERMINAL_STATUSES = {
-    "accepted", "wrong_answer", "tle", "mle",
-    "runtime_error", "compile_error", "system_error", "dead",
-}
+# K6 契约测试用：DB 状态机的全部终态。
+# ★ 权威来源 = worker/src/db.cpp 的 judge_status_to_string switch——直接解析
+#   源码生成，不做手工副本（手工副本本身就是 K6 要消灭的那类漂移）。
+# 前端 TERMINAL/STATUS_TEXT 必须与它对齐。
+def _db_statuses_from_db_cpp() -> dict:
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent
+           / "worker" / "src" / "db.cpp").read_text(encoding="utf-8")
+    m = re.search(
+        r"const char\* judge_status_to_string\(JudgeStatus s\) \{(.*?)\n\}",
+        src, re.S)
+    assert m, "db.cpp 里找不到 judge_status_to_string（被重构？同步本函数）"
+    pairs = re.findall(r'case JudgeStatus::(\w+):\s*return "([a-z_]+)"', m.group(1))
+    assert pairs, "switch 里一个 case 都没解析到——正则与代码风格漂移了"
+    mapping = dict(pairs)
+    assert len(mapping) == len(pairs), "枚举值到字符串必须一一对应（出现重复）"
+    return mapping
+
+
+_DB_STATUS_MAP = _db_statuses_from_db_cpp()
+# 终态 = 全部状态 - 两个非终态（pending/judging 是状态机的中间态）
+DB_TERMINAL_STATUSES = set(_DB_STATUS_MAP.values()) - {"pending", "judging"}
 
 
 class FakeCursor:
@@ -384,7 +402,8 @@ def test_frontend_terminal_set_covers_all_db_terminal_statuses():
     missing = DB_TERMINAL_STATUSES - frontend_terminal
     assert not missing, (
         f"前端 TERMINAL 缺少终态 {sorted(missing)}——这些状态会无限轮询。"
-        "词汇表以 worker/src/db.cpp finish() 白名单为准，四层必须同步。"
+        "词汇表以 worker/src/db.cpp judge_status_to_string 为准（本文件顶部"
+        "直接解析源码生成，无手工副本），四层必须同步。"
     )
 
 
