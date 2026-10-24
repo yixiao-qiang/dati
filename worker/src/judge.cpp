@@ -474,6 +474,16 @@ JudgeStatus parse_status(const std::string& s) {
     if (s == "TLE")             return JudgeStatus::TimeLimit;
     if (s == "MLE")             return JudgeStatus::MemoryLimit;
     if (s == "RE")              return JudgeStatus::RuntimeError;
+    // ★ runner 的 status_to_string 输出全名（"RUNTIME_ERROR"/"NONZERO_EXIT"），
+    //   不只短码——旧映射只认 "RE"，RE 程序（signal 11 等）与 exit≠0 程序
+    //   全部落 default 被判 SystemError（Wave 1 遗留，e2e RE 场景首测暴露）。
+    //   NONZERO_EXIT：正常退出但 exit code≠0，属运行时行为，归 RuntimeError。
+    if (s == "RUNTIME_ERROR" || s == "NONZERO_EXIT")
+        return JudgeStatus::RuntimeError;
+    // OLE：输出超限（runner 主动杀，stdout+stderr 超 output_limit）。DB 状态机
+    //   无独立 OLE 枚举，归 WrongAnswer（答案输出不合规；不归 RE——程序本身
+    //   没崩，是输出量级问题）。与前端 8 终态词汇表保持一致。
+    if (s == "OLE")             return JudgeStatus::WrongAnswer;
     if (s == "CE")              return JudgeStatus::CompileError;
     if (s == "INTERNAL_ERROR")  return JudgeStatus::SystemError;
     return JudgeStatus::SystemError;

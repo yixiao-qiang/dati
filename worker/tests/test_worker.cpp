@@ -93,6 +93,12 @@ void test_parse_status() {
     CHECK(worker::parse_status("TLE") == JudgeStatus::TimeLimit);
     CHECK(worker::parse_status("MLE") == JudgeStatus::MemoryLimit);
     CHECK(worker::parse_status("RE") == JudgeStatus::RuntimeError);
+    // ★ runner 实际输出全名（status_to_string）：RE 程序/exit≠0 程序（Wave 1 遗留
+    //   漏映射，e2e RE 场景首测暴露——只认短码会把 RUNTIME_ERROR 落成 SystemError）
+    CHECK(worker::parse_status("RUNTIME_ERROR") == JudgeStatus::RuntimeError);
+    CHECK(worker::parse_status("NONZERO_EXIT") == JudgeStatus::RuntimeError);
+    // OLE 输出超限：DB 无独立枚举，归 WrongAnswer（与前端 8 终态词汇表一致）
+    CHECK(worker::parse_status("OLE") == JudgeStatus::WrongAnswer);
     CHECK(worker::parse_status("CE") == JudgeStatus::CompileError);
     CHECK(worker::parse_status("INTERNAL_ERROR") == JudgeStatus::SystemError);
     // fail-closed：未知/空串都落 SystemError（读不懂就当系统错误，不猜）
