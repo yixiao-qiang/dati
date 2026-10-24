@@ -13,11 +13,12 @@ OJ 判题 server · Wave 3 台阶 1：提交接口登记化（异步判题闭环
 - Redis 挂了不阻塞提交，恢复后投递器补投——本地事务 + 最终一致
 """
 import os
+from typing import List, Optional
 
 import pymysql
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 DB_CONFIG = {
     "host": os.environ.get("OJ_DB_HOST", "127.0.0.1"),
@@ -53,7 +54,7 @@ class TestcaseItem(BaseModel):
     score: int = 1
 
 class AddTestcasesRequest(BaseModel):
-    testcases: list[TestcaseItem]
+    testcases: List[TestcaseItem]
 
 def create_submission(code: str, language: str, problem_id: int = 1) -> int:
     """一个事务写 submission + outbox，返回 submission_id。
@@ -101,7 +102,7 @@ def submit(req: SubmitRequest):
     return {"submission_id": sid}
 
 
-def get_submission(sid: int) -> dict | None:
+def get_submission(sid: int) -> Optional[dict]:
     """根据 submission_id 查询提交状态。"""
     conn = pymysql.connect(**DB_CONFIG)
     try:
@@ -150,7 +151,7 @@ def list_problems() -> list:
         conn.close()
     return rows
 
-def get_problem_with_testcases(pid) -> dict | None:
+def get_problem_with_testcases(pid) -> Optional[dict]:
     """根据题目 ID 查询题目及所有测试用例。
 
     None = 题目不存在（HTTP 层据此 404）。
@@ -177,7 +178,7 @@ def get_problem_with_testcases(pid) -> dict | None:
         conn.close()
     return row
 
-def add_testcases(pid, testcases) -> int | None:
+def add_testcases(pid, testcases) -> Optional[int]:
     """给题目挂载测试用例。
 
     None = 题目不存在（HTTP 层据此 404）；否则返回插入条数。
