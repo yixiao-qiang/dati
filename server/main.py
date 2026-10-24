@@ -95,13 +95,26 @@ end
 """
 RATE_LIMIT_BURST = 20       # 桶容量：允许一次突发 20 次
 RATE_LIMIT_RATE = 10 / 60.0  # 每秒补充：10 次/分
+# 认证路径限流（Wave 5 审查 P2）：登录/注册是最该限流的口——
+# 批量注册刷垃圾用户（每注册一行 + 一行 outbox）、暴力破解密码
+# （scrypt 慢哈希只是拖慢单次，不限速就是可并行爆破）。比 submit 更严：
+# 正常用户登录/注册是低频操作，5 次/分 / 3 次/分足够宽松。
+LOGIN_LIMIT_BURST = 5
+LOGIN_LIMIT_RATE = 5 / 60.0
+REGISTER_LIMIT_BURST = 3
+REGISTER_LIMIT_RATE = 3 / 60.0
 
 
-def check_rate_limit(ip: str) -> Optional[int]:
-    """令牌桶检查：返回 None=放行；返回等待秒数=限流（调用方转 429）。"""
+def check_rate_limit(key: str, burst: int, rate: float) -> Optional[int]:
+    """令牌桶检查：返回 None=放行；返回等待秒数=限流（调用方转 429）。
+
+    key 形如 rate:{ip}:{scope}：submit/login/register 各用独立桶，额度互不
+    共享——攻击者不能"绕过 submit 限流转去打 login"（反过来也一样）。
+    burst/rate 按接口语义传：写接口放宽、认证接口收紧。
+    """
     now = int(time.time())
     allowed, wait = REDIS.eval(
-        RATE_LIMIT_LUA, 1, f"rate:{ip}", RATE_LIMIT_BURST, RATE_LIMIT_RATE, now)
+        RATE_LIMIT_LUA, 1, key, burst, rate, now)
     return None if allowed else wait
 
 
@@ -275,7 +288,15 @@ class AuthRequest(BaseModel):
     password: str
 
 @app.post("/api/register", status_code=201)
-def register(req: AuthRequest):
+def register(req: AuthRequest, request: Request):
+    # 限流最先（P2：防批量注册刷垃圾用户）；429 与 400/409 并列，
+    # 是"请求合法但用得太快"，不是"你的输入错"
+    wait = check_rate_limit(
+        f"rate:{request.client.host}:register", REGISTER_LIMIT_BURST, REGISTER_LIMIT_RATE)
+    if wait:
+        raise HTTPException(
+            status_code=429, detail=f"请求过于频繁，请 {wait} 秒后重试",
+            headers={"Retry-After": str(wait)})
     if not USERNAME_RE.match(req.username):
         raise HTTPException(status_code=400, detail="用户名需 3-20 位字母/数字/下划线")
     if len(req.password) < MIN_PASSWORD_LEN:
@@ -289,7 +310,14 @@ def register(req: AuthRequest):
     return {"username": req.username}
 
 @app.post("/api/login")
-def login(req: AuthRequest):
+def login(req: AuthRequest, request: Request):
+    # 限流最先（P2：防暴力破解——scrypt 慢哈希只是拖慢单次，不限速就能并行爆破）
+    wait = check_rate_limit(
+        f"rate:{request.client.host}:login", LOGIN_LIMIT_BURST, LOGIN_LIMIT_RATE)
+    if wait:
+        raise HTTPException(
+            status_code=429, detail=f"请求过于频繁，请 {wait} 秒后重试",
+            headers={"Retry-After": str(wait)})
     # 格式校验同样做（400）；凭据错统一 401——不泄露"用户名是否存在"
     if not USERNAME_RE.match(req.username) or len(req.password) < MIN_PASSWORD_LEN:
         raise HTTPException(status_code=400, detail="用户名或密码格式错误")
@@ -332,7 +360,8 @@ def require_auth(authorization: str = Header(None)) -> dict:
 @app.post("/api/submit", status_code=201)
 def submit(req: SubmitRequest, request: Request, auth: dict = Depends(require_auth)):
     # 限流最先（防恶意刷校验路径）；429 是"请求合法但用得太快"，语义与 400/404/401/500 并列
-    wait = check_rate_limit(request.client.host)
+    wait = check_rate_limit(
+        f"rate:{request.client.host}:submit", RATE_LIMIT_BURST, RATE_LIMIT_RATE)
     if wait:
         raise HTTPException(
             status_code=429,

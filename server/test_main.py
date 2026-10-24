@@ -489,6 +489,19 @@ def fake_redis():
     return FakeRedis()
 
 
+@pytest.fixture(autouse=True)
+def _mock_redis_by_default(monkeypatch, fake_redis):
+    """默认把 REDIS 换成空 FakeRedis（放行）——防止测试打到真 Redis。
+
+    P2 教训：login/register 加限流后，不 mock REDIS 的测试会走**真 Redis**
+    令牌桶——同一 'testclient' IP 的桶被前面测试耗尽 → 第 4 个 register 测试
+    就开始 429，误伤无关测试。autouse 让所有测试默认走 FakeRedis；
+    ★ 复用 fake_redis 同一实例（不 new 一个）：限流专项测试改它的 eval_result
+    才作用于 main.REDIS 指向的对象；auth_ctx 也用同一实例注入 session。
+    """
+    monkeypatch.setattr(main, "REDIS", fake_redis)
+
+
 @pytest.fixture
 def auth_ctx(monkeypatch, fake_redis):
     """已登录上下文：Redis 里有 session:tok→7，返回可直接传 headers 的字典。
@@ -735,7 +748,7 @@ def test_check_rate_limit_allows():
     old = main.REDIS
     main.REDIS = fake
     try:
-        assert main.check_rate_limit("1.2.3.4") is None, "放行返回 None"
+        assert main.check_rate_limit("rate:1.2.3.4:submit", 20, 10 / 60.0) is None, "放行返回 None"
     finally:
         main.REDIS = old
     assert fake.calls and fake.calls[0][0] == "eval", "限流必须走 Redis Lua（原子性）"
@@ -747,9 +760,43 @@ def test_check_rate_limit_rejects_with_wait_seconds():
     old = main.REDIS
     main.REDIS = fake
     try:
-        assert main.check_rate_limit("1.2.3.4") == 5, "限流返回等待秒数"
+        assert main.check_rate_limit("rate:1.2.3.4:submit", 20, 10 / 60.0) == 5, "限流返回等待秒数"
     finally:
         main.REDIS = old
+
+
+def test_rate_limit_key_is_scoped_per_endpoint():
+    """P2：每个接口独立桶（key 带 scope）——submit 的限流额度不能和 login 共享。"""
+    fake = FakeRedis()
+    old = main.REDIS
+    main.REDIS = fake
+    try:
+        main.check_rate_limit("rate:1.2.3.4:submit", 20, 10 / 60.0)
+        main.check_rate_limit("rate:1.2.3.4:login", 5, 5 / 60.0)
+    finally:
+        main.REDIS = old
+    keys = [c[2] for c in fake.calls if c[0] == "eval"]  # eval 调用: ("eval", numkeys, key, burst, rate, now)
+    assert "rate:1.2.3.4:submit" in keys and "rate:1.2.3.4:login" in keys, \
+        "submit 与 login 必须用不同 key——额度隔离是独立限流的本质"
+
+
+def test_login_429_when_rate_limited(client, fake_redis):
+    """P2：登录被限流 → 429（暴力破解防护）。"""
+    fake_redis.eval_result = [0, 8]  # Lua 返回"限流，等 8 秒"
+    resp = client.post("/api/login",
+                       json={"username": "alice", "password": "secret123"})
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "8"
+    assert "8 秒" in resp.json()["detail"]
+
+
+def test_register_429_when_rate_limited(client, fake_redis):
+    """P2：注册被限流 → 429（防批量注册刷垃圾用户）。"""
+    fake_redis.eval_result = [0, 3]
+    resp = client.post("/api/register",
+                       json={"username": "spamuser", "password": "pass1234"})
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "3"
 
 
 def test_create_submission_with_user_id(fake_conn):
