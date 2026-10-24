@@ -82,9 +82,13 @@ int setup(const std::string& binary_path) {
     std::string new_root(tmpl);
 
     // 3. 挂载 tmpfs（nodev/nosuid；不用 NOEXEC，因为要在上面执行 /bin/prog）
+    //    ★ mode=0755 而非 0700：child_func 在 execve 前降权到 nobody（见
+    //    runner.cpp 知识点9），0700 的根目录 nobody 无 x 位 → 连 /bin/prog
+    //    都无法穿越——所有判题都会 execve EACCES。0755 只放开"穿越+执行"：
+    //    tmpfs 是内存文件系统、64m 封顶、pivot_root 后与宿主隔离，无泄露面。
     if (mount("tmpfs", new_root.c_str(), "tmpfs",
               MS_NODEV | MS_NOSUID,
-              "size=64m,mode=0700") != 0) {
+              "size=64m,mode=0755") != 0) {
         std::fprintf(stderr, "rootfs: mount tmpfs 失败: %s\n", std::strerror(errno));
         rmdir(new_root.c_str());
         return -1;
@@ -106,7 +110,9 @@ int setup(const std::string& binary_path) {
     std::string prog_path = new_root + "/bin/prog";
     if (!copy_file(binary_path, prog_path)) {
         std::fprintf(stderr, "rootfs: 复制二进制失败\n");
-        umount(new_root.c_str());
+        // MNT_DETACH：失败路径下子挂载可能已建好（bind/proc），普通 umount
+        // 会 EBUSY 失败 → tmpfs 残留泄漏；延迟卸载把整棵挂载树摘干净
+        umount2(new_root.c_str(), MNT_DETACH);
         rmdir(new_root.c_str());
         return -1;
     }
@@ -123,7 +129,7 @@ int setup(const std::string& binary_path) {
     for (const auto& lib : libs) {
         if (!bind_ro(lib.src, new_root + lib.dst)) {
             std::fprintf(stderr, "rootfs: 挂载动态库目录失败: %s\n", lib.src);
-            umount(new_root.c_str());
+        umount2(new_root.c_str(), MNT_DETACH);
             rmdir(new_root.c_str());
             return -1;
         }
@@ -133,10 +139,13 @@ int setup(const std::string& binary_path) {
     //    面试要点：沙箱内读 /proc/self/* 是常见需求（如 mountinfo/status）；
     //    配合 CLONE_NEWPID，这里看到的是新 pidns 的进程视图，不泄漏宿主进程。
     //    MS_NOEXEC|MS_NODEV|MS_NOSUID 防止在 /proc 上执行/创建设备。
+    //    ★ MS_RDONLY：子进程已降权到 nobody，但 proc 全局 sysctl（modprobe 等）
+    //    不随 namespace 隔离——只读挂载是第二道闸，即使未来某条降权路径漏掉，
+    //    root 也无法写 /proc/sys（宿主提权原语被物理关闭）。
     if (mount("proc", (new_root + "/proc").c_str(), "proc",
-              MS_NODEV | MS_NOEXEC | MS_NOSUID, nullptr) != 0) {
+              MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_RDONLY, nullptr) != 0) {
         std::fprintf(stderr, "rootfs: 挂载 /proc 失败: %s\n", std::strerror(errno));
-        umount(new_root.c_str());
+        umount2(new_root.c_str(), MNT_DETACH);
         rmdir(new_root.c_str());
         return -1;
     }
@@ -144,14 +153,14 @@ int setup(const std::string& binary_path) {
     // 8. chdir 到新根，pivot_root
     if (chdir(new_root.c_str()) != 0) {
         std::fprintf(stderr, "rootfs: chdir 失败: %s\n", std::strerror(errno));
-        umount(new_root.c_str());
+        umount2(new_root.c_str(), MNT_DETACH);
         rmdir(new_root.c_str());
         return -1;
     }
 
     if (syscall(SYS_pivot_root, ".", ".") != 0) {
         std::fprintf(stderr, "rootfs: pivot_root 失败: %s\n", std::strerror(errno));
-        umount(new_root.c_str());
+        umount2(new_root.c_str(), MNT_DETACH);
         rmdir(new_root.c_str());
         return -1;
     }

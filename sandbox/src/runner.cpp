@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <grp.h>     // setgroups（降权前清空补充组，防止组权限残留）
 #include <unistd.h>
 #include <cerrno>
 #include <sys/resource.h>
@@ -100,6 +101,21 @@ static int child_func(void* arg) {
         r1.rlim_cur = args->cpu_limit_sec;
         r1.rlim_max = args->cpu_limit_sec;
         setrlimit(RLIMIT_CPU, &r1);
+    }
+    // === 知识点9：execve 前降权到 nobody（uid/gid 65534）===
+    // 面试要点：clone 没带 CLONE_NEWUSER，子进程 uid 0 = 宿主的真实 root。
+    //   PR_SET_NO_NEW_PRIVS 只防"execve 获得新权限"，不剥夺已持有的 root——
+    //   root 身份 + proc 可写 = 宿主提权路径（写 /proc/sys/kernel/modprobe 等
+    //   非 namespace 化 sysctl，经典提权原语；读 /proc/kcore 泄漏宿主物理内存）。
+    //   setuid 降权会清空 capability 集，之后无法再提权回来。
+    // 顺序关键：必须在 seccomp 之前——seccomp 白名单未放行 setuid，
+    //   放在 seccomp 之后会被 ENOSYS 拒绝，降权静默失败，execve 仍是 root。
+    //   rootfs::setup（pivot_root 等 mount）已在上面完成，不需要再持有特权。
+    if (setgroups(0, nullptr) != 0 ||
+        setgid(65534) != 0 ||
+        setuid(65534) != 0) {
+        std::fprintf(stderr, "沙箱：降权失败\n");
+        _exit(127);
     }
     if (seccomp::apply_runtime_filter() != 0) {
         std::fprintf(stderr, "沙箱：seccomp 加载失败\n");
