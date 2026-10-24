@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS submission (
     language VARCHAR(16) NOT NULL DEFAULT 'cpp', -- 语言（白名单 cpp/c）
     user_id BIGINT NULL,                        -- 提交者（Wave5 台阶2：认证后落库；NULL=认证上线前的老提交）
     status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 状态机当前位置（pending/judging/终态/dead 死信）
+    error_msg VARCHAR(512) NULL,                -- 系统错误人类可读原因（Wave5 台阶5：judge_main error_msg 链路打通）
     judge_started_at DATETIME NULL,              -- worker 抢到任务的时刻（rescue 判死依据）
     retry_count INT NOT NULL DEFAULT 0,          -- 已被 rescue 重置次数（>=3 进死信）
     result VARCHAR(20) NULL,                     -- 终态结果（accepted/tle/mle/...，与终态 status 一致）
@@ -93,3 +94,41 @@ CREATE TABLE IF NOT EXISTS users(
     password_hash VARCHAR(128) NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
+
+-- ============================================================
+-- Wave 5 台阶 5：外键与唯一约束
+--
+-- 为什么用外键（面试点）：应用层存在性检查有 TOCTOU 竞态窗口
+-- （查-插之间数据被并发删除），DB 级约束是唯一可靠的兜底；
+-- 孤儿数据（提交挂不存在的题/用户、用例挂不存在的题）从此
+-- 不可能静默写入。
+-- 为什么统一放末尾 ALTER 而不是写进 CREATE TABLE：
+--   submission 引用 users，而 users 建在后面——建表顺序依赖
+--   会让 CREATE 报"表不存在"。所有表建好后统一 ALTER 最稳。
+-- 为什么 (problem_id, ordinal) 唯一：
+--   重复挂载用例会 ordinal 重叠 → 判题顺序歧义（ORDER BY ordinal
+--   结果不确定）。唯一约束让重复挂载直接失败。
+--
+-- ★ 老库升级（已存在的表，ALTER 手动执行，注意幂等/孤儿数据）：
+--   ALTER TABLE submission
+--     ADD COLUMN error_msg VARCHAR(512) NULL AFTER status,
+--     ADD CONSTRAINT fk_submission_problem FOREIGN KEY (problem_id) REFERENCES problem(id),
+--     ADD CONSTRAINT fk_submission_user FOREIGN KEY (user_id) REFERENCES users(id);
+--   ALTER TABLE testcase
+--     ADD CONSTRAINT fk_testcase_problem FOREIGN KEY (problem_id) REFERENCES problem(id),
+--     ADD UNIQUE KEY uk_testcase_problem_ordinal (problem_id, ordinal);
+--   ALTER TABLE outbox
+--     ADD CONSTRAINT fk_outbox_submission FOREIGN KEY (submission_id) REFERENCES submission(id);
+-- 外键失败 = 库里已有孤儿数据，先排查清理再 ALTER（外键是"从此以后"的约束，
+-- 不追溯修复存量数据）。
+-- ============================================================
+ALTER TABLE submission
+    ADD CONSTRAINT fk_submission_problem FOREIGN KEY (problem_id) REFERENCES problem(id),
+    ADD CONSTRAINT fk_submission_user FOREIGN KEY (user_id) REFERENCES users(id);
+
+ALTER TABLE testcase
+    ADD CONSTRAINT fk_testcase_problem FOREIGN KEY (problem_id) REFERENCES problem(id),
+    ADD UNIQUE KEY uk_testcase_problem_ordinal (problem_id, ordinal);
+
+ALTER TABLE outbox
+    ADD CONSTRAINT fk_outbox_submission FOREIGN KEY (submission_id) REFERENCES submission(id);

@@ -216,6 +216,7 @@ FULL_ROW = {
     "stderr": "",
     "passed_cases": 3,
     "total_cases": 3,
+    "error_msg": None,   # 台阶5：system_error 等故障原因（正常终态为 NULL）
     "created_at": None,
 }
 
@@ -234,6 +235,19 @@ def test_get_submission_returns_200_with_full_fields(client, monkeypatch):
     assert body["stderr"] == ""
     assert body["passed_cases"] == 3 and body["total_cases"] == 3
     assert "language" in body and "created_at" in body
+    # 台阶5：error_msg 字段必须透传（normal 终态为 None；system_error 时为原因文本）
+    assert "error_msg" in body and body["error_msg"] is None
+
+
+def test_get_submission_error_msg_transparent(client, monkeypatch):
+    """system_error 时 error_msg 必须原样返回——用户要看到"为什么失败"。"""
+    sys_row = dict(FULL_ROW, status="system_error", result="system_error",
+                   error_msg="judge_main 运行超时")
+    monkeypatch.setattr(main, "get_submission", lambda sid: sys_row)
+
+    resp = client.get("/api/submission/28")
+    assert resp.status_code == 200
+    assert resp.json()["error_msg"] == "judge_main 运行超时"
 
 
 def test_get_submission_404_when_not_exists(client, monkeypatch):

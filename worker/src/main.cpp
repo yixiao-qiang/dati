@@ -116,7 +116,7 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
         sys.status = worker::JudgeStatus::SystemError;
         sys.error_msg = "题目没有测试用例";
         db.finish(m.submission_id, sys.status, sys.stdout_text, sys.stderr_text,
-                  0, 0, &err);   // 无用例：0/0，不是 out 的值（out 与本题无关）
+                  sys.error_msg, 0, 0, &err);   // 无用例：0/0，不是 out 的值（out 与本题无关）
         q.ack(m.id, nullptr);
         return;
     }
@@ -145,7 +145,7 @@ void process_one(worker::Queue& q, worker::Db& db, const char* judge_main,
     }
 
     if (!db.finish(m.submission_id, out.status, out.stdout_text, out.stderr_text,
-                   out.passed_cases, out.total_cases, &err)) {
+                   out.error_msg, out.passed_cases, out.total_cases, &err)) {
         std::fprintf(stderr, "finish 失败(id=%lld):%s\n",
                      (long long)m.submission_id, err.c_str());
         return;

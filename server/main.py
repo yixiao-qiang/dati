@@ -363,7 +363,7 @@ def get_submission(sid: int) -> Optional[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, language, status, result, stdout, stderr, "
-                "passed_cases, total_cases, created_at "
+                "passed_cases, total_cases, error_msg, created_at "
                 "FROM submission WHERE id=%s",
                 (sid,),
             )
@@ -528,6 +528,7 @@ def submission_status(sid: int):
         "stderr": row["stderr"],
         "passed_cases": row["passed_cases"],   # 台阶3：通过/总用例数（展示+部分分基础）
         "total_cases": row["total_cases"],
+        "error_msg": row.get("error_msg"),     # 台阶5：system_error 等故障的人类可读原因
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
     }
 

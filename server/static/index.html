@@ -250,6 +250,11 @@ int main() {
         '--- stderr ---',
         data.stderr || '（空）',
       ];
+      // Wave 5 台阶 5：系统错误要展示原因——只有"系统错误"四个字用户没法行动
+      if (data.status === 'system_error' && data.error_msg) {
+        lines.push('--- 系统错误原因 ---');
+        lines.push(data.error_msg);
+      }
       result.textContent = lines.join('\n');
     }
 

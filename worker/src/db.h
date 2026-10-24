@@ -65,10 +65,13 @@ public:
     // 返回 false                  = 数据库错误（不要 ACK，让消息留在 PEL 等重试）
     bool claim(int64_t submission_id, std::string* err, bool* claimed);
 
-    // 判题完成：写入终态与结果（stdout/stderr 截断存储，避免单行超长）
+    // 判题完成：写入终态与结果（stdout/stderr 截断存储，避免单行超长）。
+    // error_msg：SystemError 等故障的人类可读原因（judge_main error_msg 链路，
+    // Wave 5 台阶 5——此前只有 status 没原因，用户只能看到"系统错误"四个字）。
     bool finish(int64_t submission_id, JudgeStatus status,
                 const std::string& stdout_text, const std::string& stderr_text,
-                int passed_cases, int total_cases,std::string* err);
+                const std::string& error_msg,
+                int passed_cases, int total_cases, std::string* err);
 
     // 读回一条提交的代码与语言（worker 判题前取源码用）
     // found 出参区分两种失败，语义不同不能混：

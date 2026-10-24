@@ -35,6 +35,11 @@ namespace {
 // 存 64KB 足够排查，且防止恶意程序刷爆存储与回显带宽。
 constexpr size_t kMaxStoredBytes = 64 * 1024;
 
+// error_msg 是短诊断文本（judge_main INTERNAL_ERROR 原因 / 编译超时等），
+// 列类型 VARCHAR(512)。与 stdout/stderr 分开截断阈值——错误原因要完整，
+// 但也不会超过 512（超了说明 error_msg 里塞了不该有的东西，截断即可）。
+constexpr size_t kMaxErrorMsgBytes = 512;
+
 }  // namespace
 
 // ---- D4 导出：内部纯函数（声明见 internal.h，供单元测试）----
@@ -155,6 +160,7 @@ bool Db::claim(int64_t submission_id, std::string* err, bool* claimed) {
 
 bool Db::finish(int64_t submission_id, JudgeStatus status,
                 const std::string& stdout_text, const std::string& stderr_text,
+                const std::string& error_msg,
                 int passed_cases, int total_cases,
                 std::string* err) {
     if (!conn_) {
@@ -187,15 +193,19 @@ bool Db::finish(int64_t submission_id, JudgeStatus status,
     const std::string st = judge_status_to_string(status);  // 来自固定 switch，可信
     const std::string out_t = truncate_utf8(stdout_text, kMaxStoredBytes);
     const std::string err_t = truncate_utf8(stderr_text, kMaxStoredBytes);
+    const std::string msg_t = truncate_utf8(error_msg, kMaxErrorMsgBytes);
     const std::string out_e = escape_sql(conn_, out_t);
     const std::string err_e = escape_sql(conn_, err_t);
+    const std::string msg_e = escape_sql(conn_, msg_t);
 
     std::string sql;
-    sql.reserve(out_e.size() + err_e.size() + 256);
+    sql.reserve(out_e.size() + err_e.size() + msg_e.size() + 320);
     sql += "UPDATE submission SET status='";
     sql += st;
     sql += "', result='";
     sql += st;
+    sql += "', error_msg='";
+    sql += msg_e;
     sql += "', passed_cases=" + std::to_string(passed_cases);
     sql += ", total_cases=" + std::to_string(total_cases);
     sql += ", stdout='";
