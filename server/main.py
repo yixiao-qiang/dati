@@ -15,15 +15,18 @@ OJ 判题 server · Wave 3 台阶 1：提交接口登记化（异步判题闭环
 import os
 from typing import List, Optional
 
+import base64
 import hashlib
 import hmac
-import base64
-import secrets
+import os
 import re
-import redis
+import secrets
+import time
+from typing import List, Optional
 
 import pymysql
-from fastapi import FastAPI, HTTPException, Header
+import redis
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -57,6 +60,50 @@ REDIS = redis.Redis(
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")  # 白名单：防奇怪字符进排行榜/注册
 MIN_PASSWORD_LEN = 8
+
+# ============ 限流（Wave 5 台阶 2：令牌桶）============
+# 为什么 Redis Lua（面试点）：令牌桶是"读桶-算补充-写桶"多步操作，普通
+# GET+SET 非原子 → 并发竞态（两个请求同时读到满桶都放行）；EVAL 在 Redis
+# 单线程内原子执行，且多 server 实例共享同一桶状态。
+# 为什么按 IP：未登录也能限（攻击者无需注册账号）；NAT 会误伤，学习期接受。
+# Lua 返回 {1, 等待秒数} 放行，{0, 等待秒数} 限流。
+RATE_LIMIT_LUA = """
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])  -- 桶容量（burst，允许的瞬时突发）
+local rate = tonumber(ARGV[2])   -- 每秒补充速率
+local now = tonumber(ARGV[3])
+local bucket = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(bucket[1])
+local ts = tonumber(bucket[2])
+if tokens == nil then
+    tokens = limit
+    ts = now
+end
+-- 按流逝时间补令牌（封顶到桶容量）
+local elapsed = math.max(0, now - ts)
+tokens = math.min(limit, tokens + elapsed * rate)
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+    redis.call('EXPIRE', key, 60)
+    return {1, 0}
+else
+    redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+    redis.call('EXPIRE', key, 60)
+    return {0, math.ceil((1 - tokens) / rate)}
+end
+"""
+RATE_LIMIT_BURST = 20       # 桶容量：允许一次突发 20 次
+RATE_LIMIT_RATE = 10 / 60.0  # 每秒补充：10 次/分
+
+
+def check_rate_limit(ip: str) -> Optional[int]:
+    """令牌桶检查：返回 None=放行；返回等待秒数=限流（调用方转 429）。"""
+    now = int(time.time())
+    allowed, wait = REDIS.eval(
+        RATE_LIMIT_LUA, 1, f"rate:{ip}", RATE_LIMIT_BURST, RATE_LIMIT_RATE, now)
+    return None if allowed else wait
+
 
 app = FastAPI(title="OJ 判题 server（Wave 3 异步判题）")
 
@@ -173,21 +220,23 @@ def create_user(username: str, password_hash: str) -> int:
     finally:
         conn.close()
 
-def create_submission(code: str, language: str, problem_id: int = 1) -> int:
+def create_submission(code: str, language: str, problem_id: int = 1,
+                      user_id: Optional[int] = None) -> int:
     """一个事务写 submission + outbox，返回 submission_id。
 
     为什么同事务（台阶 1 核心设计决策）：
     - 拆两个事务 → submission 成功、outbox 失败 → 提交"登记了"但永远不会被投递，
       pending 一辈子（与 worker P0-2 同款的无声丢失）
     - 同事务保证要么都成功要么都不发生——用户拿不到 id 即可安全重试
+    user_id：认证后落库（台阶 2）；None=认证上线前的老提交/未登录期数据
     """
     conn = pymysql.connect(**DB_CONFIG)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO submission (problem_id, code, language, status) "
-                "VALUES (%s, %s, %s, 'pending')",
-                (problem_id, code, language),
+                "INSERT INTO submission (problem_id, code, language, status, user_id) "
+                "VALUES (%s, %s, %s, 'pending', %s)",
+                (problem_id, code, language, user_id),
             )
             sid = cur.lastrowid
             cur.execute(
@@ -261,8 +310,35 @@ def logout(authorization: str = Header(None)):
     REDIS.delete(f"{SESSION_PREFIX}{token}")
     return {"ok": True}
 
+
+def require_auth(authorization: str = Header(None)) -> dict:
+    """认证依赖：解析 Authorization 头 → Redis 查 session → 返回用户上下文。
+
+    为什么用 Depends 而不是中间件（面试点）：
+    - 中间件对每个请求都执行（含静态资源/GET 查询接口），认证只保护"写"接口；
+    - Depends 按路由声明作用域精确，依赖函数可单独单测；
+    - 注意：FastAPI 注册路由时已捕获本函数引用，测试替换依赖要 mock 底层 REDIS，
+      而不是 monkeypatch 本函数（monkeypatch 对本函数不生效）。
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    token = authorization[len("Bearer "):].strip()
+    uid = REDIS.get(f"{SESSION_PREFIX}{token}")
+    if uid is None:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期")
+    return {"user_id": int(uid), "token": token}
+
+
 @app.post("/api/submit", status_code=201)
-def submit(req: SubmitRequest):
+def submit(req: SubmitRequest, request: Request, auth: dict = Depends(require_auth)):
+    # 限流最先（防恶意刷校验路径）；429 是"请求合法但用得太快"，语义与 400/404/401/500 并列
+    wait = check_rate_limit(request.client.host)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"请求过于频繁，请 {wait} 秒后重试",
+            headers={"Retry-After": str(wait)},   # HTTP 标准：告诉客户端等几秒
+        )
     # 校验前置：参数错是用户的错（400），题目不存在是凭据错（404），
     # DB 错是环境的错（500）——三者必须分开（面试点）
     if len(req.code.encode("utf-8")) > MAX_CODE_BYTES:
@@ -273,7 +349,7 @@ def submit(req: SubmitRequest):
     try:
         if not problem_exists(req.problem_id):
             raise HTTPException(status_code=404, detail=f"题目不存在: {req.problem_id}")
-        sid = create_submission(req.code, req.language, req.problem_id)
+        sid = create_submission(req.code, req.language, req.problem_id, auth["user_id"])
     except pymysql.MySQLError:
         raise HTTPException(status_code=500, detail="数据库不可用，请稍后重试")
 

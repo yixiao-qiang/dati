@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS submission (
     problem_id BIGINT NOT NULL DEFAULT 1,        -- 关联题目（限额从 problem 表读）
     code MEDIUMTEXT NOT NULL,                    -- 用户源码（server 限制 64KB，MEDIUMTEXT 16MB 富余）
     language VARCHAR(16) NOT NULL DEFAULT 'cpp', -- 语言（白名单 cpp/c）
+    user_id BIGINT NULL,                        -- 提交者（Wave5 台阶2：认证后落库；NULL=认证上线前的老提交）
     status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 状态机当前位置（pending/judging/终态/dead 死信）
     judge_started_at DATETIME NULL,              -- worker 抢到任务的时刻（rescue 判死依据）
     retry_count INT NOT NULL DEFAULT 0,          -- 已被 rescue 重置次数（>=3 进死信）
@@ -45,6 +46,10 @@ CREATE TABLE IF NOT EXISTS submission (
     passed_cases INT NOT NULL DEFAULT 0,      -- 已通过的测试点数
     total_cases INT NOT NULL DEFAULT 0       -- 总测试点数
 ) ENGINE=InnoDB;
+
+-- 老库升级（Wave 5 台阶 2）：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列
+-- （K2 教训），Wave 3 前建过的库需手动执行：
+--   ALTER TABLE submission ADD COLUMN user_id BIGINT NULL AFTER language;
 
 -- 专用账号：oj / oj123456（学习期口令，生产必须换强口令 + 最小权限）
 -- 只授 oj 库权限，不授全局

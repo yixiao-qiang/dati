@@ -8,6 +8,7 @@
 """
 import pymysql
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import main
@@ -116,9 +117,11 @@ def test_create_submission_writes_both_tables_in_one_transaction(fake_conn):
     assert sqls[1].startswith("INSERT INTO outbox"), "第二条是 outbox"
     assert "status" in sqls[0] and "'pending'" in sqls[0], "提交初始状态 pending"
     assert "problem_id" in sqls[0], "INSERT 带 problem_id 列"
+    assert "user_id" in sqls[0], "INSERT 带 user_id 列（台阶 2 认证后落库）"
     sub_args = fake_conn.cursor_.executed[0][1]
     assert sub_args[0] == 1, "默认 problem_id=1（限额从 problem 表读）"
     assert sub_args[1] == "int main(){}" and sub_args[2] == "cpp", "code/language 顺序正确"
+    assert sub_args[3] is None, "默认无认证信息时 user_id 落 NULL（老提交语义）"
     outbox_args = fake_conn.cursor_.executed[1][1]
     assert outbox_args == (42,), "outbox 关联刚插入的 submission_id"
     assert "judged" in sqls[1] and "0" in sqls[1], "event=judged, delivered=0"
@@ -140,57 +143,64 @@ def test_create_submission_rolls_back_when_outbox_insert_fails(monkeypatch):
 
 # ---------- 接口校验 ----------
 
-def test_submit_returns_201_with_submission_id(client, monkeypatch):
+def test_submit_returns_201_with_submission_id(client, monkeypatch, auth_ctx):
     monkeypatch.setattr(main, "problem_exists", lambda pid: True)
-    monkeypatch.setattr(main, "create_submission", lambda code, lang, pid: 42)
+    monkeypatch.setattr(main, "create_submission",
+                        lambda code, lang, pid, uid: 42)
 
-    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"})
+    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"},
+                       headers=auth_ctx)
 
     assert resp.status_code == 201
     assert resp.json() == {"submission_id": 42}
 
 
-def test_submit_404_when_problem_missing(client, monkeypatch):
+def test_submit_404_when_problem_missing(client, monkeypatch, auth_ctx):
     """题目不存在必须入口处 404——不能等 worker 判题时落 system_error。"""
     monkeypatch.setattr(main, "problem_exists", lambda pid: False)
     monkeypatch.setattr(main, "create_submission",
-                        lambda code, lang, pid: (_ for _ in ()).throw(AssertionError(
+                        lambda code, lang, pid, uid: (_ for _ in ()).throw(AssertionError(
                             "题目不存在时绝不能写 submission")))
 
     resp = client.post("/api/submit",
-                       json={"code": "int main(){}", "language": "cpp", "problem_id": 99})
+                       json={"code": "int main(){}", "language": "cpp", "problem_id": 99},
+                       headers=auth_ctx)
 
     assert resp.status_code == 404
     assert "99" in resp.json()["detail"]
 
 
-def test_submit_422_when_problem_id_not_positive(client):
+def test_submit_422_when_problem_id_not_positive(client, auth_ctx):
     """problem_id ge=1：0/负数是参数错，pydantic 422 拒绝。"""
     resp = client.post("/api/submit",
-                       json={"code": "int main(){}", "language": "cpp", "problem_id": 0})
+                       json={"code": "int main(){}", "language": "cpp", "problem_id": 0},
+                       headers=auth_ctx)
     assert resp.status_code == 422
 
 
-def test_submit_rejects_code_over_64kb(client):
+def test_submit_rejects_code_over_64kb(client, auth_ctx):
     resp = client.post(
         "/api/submit",
         json={"code": "x" * (MAX_CODE_BYTES + 1), "language": "cpp"},
+        headers=auth_ctx,
     )
     assert resp.status_code == 400
 
 
-def test_submit_rejects_unsupported_language(client):
-    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "java"})
+def test_submit_rejects_unsupported_language(client, auth_ctx):
+    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "java"},
+                       headers=auth_ctx)
     assert resp.status_code == 400
 
 
-def test_submit_returns_500_when_db_unavailable(client, monkeypatch):
-    def boom(code, lang, pid):
+def test_submit_returns_500_when_db_unavailable(client, monkeypatch, auth_ctx):
+    def boom(code, lang, pid, uid):
         raise pymysql.OperationalError("db is down")
 
     monkeypatch.setattr(main, "create_submission", boom)
 
-    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"})
+    resp = client.post("/api/submit", json={"code": "int main(){}", "language": "cpp"},
+                       headers=auth_ctx)
     assert resp.status_code == 500
     assert "数据库" in resp.json()["detail"], "500 要给用户可行动的信息，不是裸错误"
 
@@ -442,6 +452,7 @@ class FakeRedis:
     def __init__(self):
         self.store = {}
         self.calls = []
+        self.eval_result = [1, 0]   # Lua 默认返回"放行"；限流测试改为 [0, wait]
 
     def setex(self, name, time, value):
         self.calls.append(("setex", name, time, value))
@@ -454,10 +465,26 @@ class FakeRedis:
     def get(self, name):
         return self.store.get(name)
 
+    def eval(self, script, numkeys, *args):
+        self.calls.append(("eval", numkeys) + args)
+        return self.eval_result
+
 
 @pytest.fixture
 def fake_redis():
     return FakeRedis()
+
+
+@pytest.fixture
+def auth_ctx(monkeypatch, fake_redis):
+    """已登录上下文：Redis 里有 session:tok→7，返回可直接传 headers 的字典。
+
+    为什么不用 monkeypatch require_auth 本身：FastAPI 注册路由时已捕获依赖
+    函数引用，monkeypatch 模块属性对已注册路由不生效——必须 mock 底层 REDIS。
+    """
+    fake_redis.store["session:tok"] = "7"
+    monkeypatch.setattr(main, "REDIS", fake_redis)
+    return {"Authorization": "Bearer tok"}
 
 
 # 供 login 测试用的"已注册用户"：模块导入时真跑一次 scrypt（~70ms，可接受）
@@ -627,3 +654,109 @@ def test_logout_200_idempotent_missing_key(client, monkeypatch, fake_redis):
 def test_logout_401_missing_header(client):
     resp = client.post("/api/logout")
     assert resp.status_code == 401, "无 Authorization 头 = 未登录，401"
+
+
+# ================= Wave 5 台阶 2 · 认证保护（submit）+ 令牌桶限流 =================
+
+def test_require_auth_returns_user_context():
+    """依赖函数可直接单测（不经过 HTTP）：头合法 + session 存在 → 用户上下文。"""
+    fake = FakeRedis()
+    fake.store["session:tok"] = "7"
+    old = main.REDIS
+    main.REDIS = fake
+    try:
+        ctx = main.require_auth("Bearer tok")
+    finally:
+        main.REDIS = old
+    assert ctx == {"user_id": 7, "token": "tok"}
+
+
+def test_require_auth_rejects_missing_header():
+    with pytest.raises(HTTPException) as e:
+        main.require_auth(None)
+    assert e.value.status_code == 401
+
+
+def test_require_auth_rejects_bad_scheme():
+    with pytest.raises(HTTPException):
+        main.require_auth("Basic abc123")
+
+
+def test_require_auth_rejects_unknown_token(monkeypatch):
+    """session 不存在的 token = 登录已过期，401。"""
+    monkeypatch.setattr(main, "REDIS", FakeRedis())
+    with pytest.raises(HTTPException):
+        main.require_auth("Bearer ghost")
+
+
+def test_submit_401_without_token(client):
+    """写接口必须认证：无 Authorization 头 → 401（台阶 2 显式决策）。"""
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp"})
+    assert resp.status_code == 401
+
+
+def test_submit_401_with_invalid_token(client, monkeypatch):
+    monkeypatch.setattr(main, "REDIS", FakeRedis())  # Redis 里没有 session
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp"},
+                       headers={"Authorization": "Bearer ghost"})
+    assert resp.status_code == 401
+
+
+def test_submit_429_when_rate_limited(client, auth_ctx, fake_redis):
+    """令牌桶耗尽 → 429 + Retry-After 头（HTTP 标准：告诉客户端等几秒）。"""
+    fake_redis.eval_result = [0, 5]  # Lua 返回"限流，等 5 秒"
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp"},
+                       headers=auth_ctx)
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "5", "Retry-After 必须带秒数"
+    assert "5 秒" in resp.json()["detail"]
+
+
+def test_check_rate_limit_allows():
+    fake = FakeRedis()
+    fake.eval_result = [1, 0]
+    old = main.REDIS
+    main.REDIS = fake
+    try:
+        assert main.check_rate_limit("1.2.3.4") is None, "放行返回 None"
+    finally:
+        main.REDIS = old
+    assert fake.calls and fake.calls[0][0] == "eval", "限流必须走 Redis Lua（原子性）"
+
+
+def test_check_rate_limit_rejects_with_wait_seconds():
+    fake = FakeRedis()
+    fake.eval_result = [0, 5]
+    old = main.REDIS
+    main.REDIS = fake
+    try:
+        assert main.check_rate_limit("1.2.3.4") == 5, "限流返回等待秒数"
+    finally:
+        main.REDIS = old
+
+
+def test_create_submission_with_user_id(fake_conn):
+    """认证后的提交必须带 user_id 落库（排行榜按用户聚合的数据基础）。"""
+    main.create_submission("int main(){}", "cpp", user_id=7)
+    args = fake_conn.cursor_.executed[0][1]
+    assert args[3] == 7, "user_id 必须写入 submission INSERT"
+
+
+def test_submit_passes_user_id_to_create_submission(client, monkeypatch, auth_ctx):
+    """端到端：认证上下文里的 user_id 必须透传到 create_submission。"""
+    captured = {}
+    monkeypatch.setattr(main, "problem_exists", lambda pid: True)
+
+    def spy(code, lang, pid, uid):
+        captured["uid"] = uid
+        return 42
+
+    monkeypatch.setattr(main, "create_submission", spy)
+    resp = client.post("/api/submit",
+                       json={"code": "int main(){}", "language": "cpp"},
+                       headers=auth_ctx)
+    assert resp.status_code == 201
+    assert captured["uid"] == 7, "认证上下文 user_id=7 必须透传到落库"
